@@ -1,0 +1,49 @@
+#!/bin/sh
+#
+# $Header: /away/cfengine/product_gpfs/vnfs/common/rootfs/etc/rc.d/init.d/RCS/syslog-ng_pc,v 1.1 2013/06/05 22:59:54 dwg Exp $
+#
+# fstab_pc
+#
+# chkconfig: 2345 11 89
+# description: auto-gen /etc/syslog-ng/syslog-ng.conf based on Perceus variables on /proc/cmdline
+# processname: none
+
+# Source the library functions
+. /etc/rc.d/init.d/functions
+
+prog=syslog-ng_pc
+
+case "$1" in
+	restart|start) 
+		echo -n "Starting $prog: "
+		MASTERIP=$(sed -e '/masterip=/!d;s/.*masterip=\([^ ]\+\).*/\1/' /proc/cmdline)
+
+		if [ -z $MASTERIP ]; then
+		   echo -n "no masterip on /proc/cmdline!"
+		   failure
+		   echo
+		   exit 1
+		fi
+
+		/usr/bin/perl -pi -e "s/\@MASTERIP\@/$MASTERIP/g" /etc/syslog-ng/syslog-ng.conf
+
+		if [ $? != 0 ]; then
+		   echo -n "unable to 's/@MASTERIP@/$MASTERIP/g' /etc/syslog-ng/syslog-ng.conf!"
+		   failure
+		   echo
+		   exit 1
+		fi
+
+		success
+		echo
+		exit 0
+
+		;;
+
+	stop) 
+		;;
+
+	*)
+		echo "Usage: $prog {stop|start|restart}"
+		exit 1
+esac

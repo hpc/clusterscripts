@@ -1,0 +1,1526 @@
+#!/bin/bash
+#
+# $Header: /away/cfengine/product_cg/vnfs/common/rootfs/etc/rc.d/init.d/RCS/autogpfs,v 1.15 2013/11/01 19:45:38 ben Exp $
+#
+# autogpfs
+#
+# chkconfig: 345 56 25
+# description: Perform automatic GPFS configuration
+# processname: none
+# config: /etc/sysconfig/autogpfs
+# pidfile: /var/run/autogpfs.pid
+
+# Source the library functions
+. /etc/rc.d/init.d/functions
+
+STATUS=0
+PATH=/usr/lpp/mmfs/bin:$PATH
+
+prog=autogpfs
+config=/etc/sysconfig/$prog
+lockfile=/var/lock/subsys/$prog
+pidfile=/var/run/$prog.pid
+[ -f $config ] && . $config
+
+shopt -s nocasematch
+
+Device=drive			# /dev/$Device mounted on /gpfs/$Device; DO NOT change this!
+DescFile=/tmp/DescFile.$$
+ImportfsFile=/tmp/ImportfsFile.$$
+
+block() {
+   local command="$1" strerror=
+
+   while [ 1 ]; do
+      echo $"$prog[ blocked ] exec '$command' failed!"
+      logger -p daemon.alert -t $prog[ blocked ] -- "exec '$command' failed!"
+      sleep ${TimeOut:-'60'}				# default: 60s
+      strerror=$($command 2>&1)
+      if [ $? -eq 0 ]; then
+	 echo $"$prog[unblocked] exec '$command' succeeded!"
+	 logger -p daemon.alert -t $prog[unblocked] -- "exec '$command' succeeded!"
+	 break
+      fi
+   done
+}
+
+warn() {
+   echo $"$prog[ warning ] $1"
+   logger -p daemon.err -t $prog[ warning ] -- "$1"
+}
+
+die() {
+   while [ 1 ]; do
+      echo $"$prog[  fatal  ] $1"
+      logger -p daemon.emerg -t $prog[  fatal  ] -- "$1"
+      sleep ${TimeOut:-'60'}				# default: 60s
+   done
+}
+
+
+do_exit() {
+   rm -f $pidfile
+   mv -f $DescFile ${DescFile%\.*} 2> /dev/null
+   mv -f $ImportfsFile ${ImportfsFile%\.*} 2> /dev/null
+   exit $STATUS
+}
+
+trap 'rm -f "$lockfile"; do_exit' 1 2 3 15 20
+
+do_contact_quorum() {
+   echo $"   Contacting GPFS quorum nodes: "
+   local NodeName= strerror=
+
+   for NodeName in "${!NodeDesc[@]}"; do
+      [[ "${NodeDesc[$NodeName]}" =~ 'nonquorum' ]] && continue
+      [[ ! "${NodeDesc[$NodeName]}"  =~ 'quorum' ]] && continue
+      echo -n $"      $NodeName: "
+      strerror=$(ssh -nx "$NodeName" '/bin/true' 2>&1)
+      if [ $? -eq 0 ]; then
+	 success
+	 echo
+      else
+	 warning
+	 echo
+	 warn "unable to exec 'ssh $NodeName /bin/true': $strerror!"
+	 block "ssh -nx $NodeName /bin/true"
+      fi
+   done
+
+   return 0
+}
+
+do_contact_member() {
+   echo -n $"      Contacting GPFS member: "
+   local NodeName="$1" strerror=
+
+   strerror=$(ssh -nx "$NodeName" '/bin/true' 2>&1)
+   if [ $? -eq 0 ]; then
+      success
+      echo
+   else
+      warning
+      echo
+      warn "unable to exec 'ssh $NodeName /bin/true': $strerror!"
+      return 1
+   fi
+
+   return 0
+}
+
+# Create the GPFS cluster.  The initial cluster is formed ONLY from the
+# (mandatory) PrimaryServer, (mandatory) SecondaryServer and any other
+# (optional) nodes providing quorum; all non-quorum members are added
+# later.  It is here assumed that both the ${Primary,Secondary}Server are
+# manager nodes providing quorum.
+do_create_cluster() {
+   echo -n $"   Creating GPFS cluster: "
+   local NodeName= args= nodedesc= strerror=
+
+   mmlscluster > /dev/null 2>&1
+   if [ $? -eq 0 ]; then
+      passed
+      echo
+   else
+      # Form the NodeDesc
+      for NodeName in "${!NodeDesc[@]}"; do
+	 [[ "${NodeDesc[$NodeName]}" =~ 'nonquorum' ]] && continue
+	 [[ ! "${NodeDesc[$NodeName]}"  =~ 'quorum' ]] && continue
+         nodedesc="$nodedesc,${NodeName}:${NodeDesc[$NodeName]}:${NodeName}"
+      done
+
+      args="-N ${nodedesc#,}"				# chop the leading ','
+      [ -n "$RemoteShellCommand" ]    && args="$args -r $RemoteShellCommand"
+      [ -n "$RemoteFileCopyCommand" ] && args="$args -R $RemoteFileCopyCommand"
+      [ -n "$ClusterName" ]           && args="$args -C $ClusterName"
+      strerror=$(mmcrcluster -p $PrimaryServer -s $SecondaryServer $args -A 2>&1)
+      if [ $? -eq 0 ]; then
+	 success
+	 echo
+      else
+	 warning
+	 echo
+	 warn "$strerror"
+	 block "mmcrcluster -p $PrimaryServer -s $SecondaryServer $args -A"
+      fi
+   fi
+
+   return 0
+}
+
+do_add_member() {
+   echo -n $"      Adding GPFS member: "
+   local NodeName="$1" strerror=
+
+   strerror=$(mmaddnode -N "${NodeName}:${NodeDesc[$NodeName]}:${NodeName}" 2>&1)
+   if [ $? -eq 0 ]; then
+      success
+      echo
+   else
+      warning
+      echo
+      warn "$strerror"
+      return 1
+   fi
+
+   return 0
+}
+
+do_assign_quorum_licenses() {
+   echo $"   Assigning GPFS licenses: "
+   local NodeName= designated= required= status= strerror=
+
+   for NodeName in "${!NodeDesc[@]}"; do
+      [[ "${NodeDesc[$NodeName]}" =~ 'nonquorum' ]] && continue
+      [[ ! "${NodeDesc[$NodeName]}"  =~ 'quorum' ]] && continue
+      echo -n $"      $NodeName: "
+      status=$(mmlslicense -L 2>&1 | grep "^${NodeName}")
+      if [ $? -ne 0 ]; then
+	 failure
+	 echo
+	 die "unable to determine license status!"
+      fi
+      required=$(echo "$status" | awk '{print $2}')
+      designated=$(echo "$status" | awk '{print $3}')
+      if [ "$designated" == "$required" ]; then
+	 echo -n $"$required "
+	 passed
+	 echo
+      else
+	 strerror=$(mmchlicense "$required" --accept -N "$NodeName" 2>&1)
+	 if [ $? -eq 0 ]; then
+	    echo -n $"$required "
+	    success
+	    echo
+	 else
+	    warning
+	    echo
+	    warn "$strerror"
+	    block "mmchlicense $required --accept -N $NodeName"
+	 fi
+      fi
+   done
+
+   return 0
+}
+
+do_assign_member_license() {
+   echo -n $"      Assigning GPFS license: "
+   local NodeName="$1" designated= required= status= strerror=
+
+   status=$(mmlslicense -L 2>&1 | grep "^${NodeName}")
+   if [ $? -ne 0 ]; then
+      failure
+      echo
+      warn "unable to determine license status!"
+      return 1
+   fi
+   required=$(echo "$status" | awk '{print $2}')
+   designated=$(echo "$status" | awk '{print $3}')
+   if [ "$designated" == "$required" ]; then
+      echo -n $"$required "
+      passed
+      echo
+   else
+      strerror=$(mmchlicense "$required" --accept -N "$NodeName" 2>&1)
+      if [ $? -eq 0 ]; then
+	 echo -n $"$required "
+	 success
+	 echo
+      else
+	 warning
+	 echo
+	 warn "$strerror"
+	 return 1
+      fi
+   fi
+
+   return 0
+}
+
+do_activate_quorum_gpfsd() {
+   echo $"$1   Activating GPFS daemons: "
+   local NodeName= state= status= strerror=
+
+   for NodeName in "${!NodeDesc[@]}"; do
+      [[ "${NodeDesc[$NodeName]}" =~ 'nonquorum' ]] && continue
+      [[ ! "${NodeDesc[$NodeName]}"  =~ 'quorum' ]] && continue
+      echo -n $"$1      $NodeName: "
+      status=$(mmgetstate -N "$NodeName" 2>&1 |             \
+	 grep -E "[[:space:]]+${NodeName%%\.*}[[:space:]]+" \
+      )
+      if [ $? -ne 0 ]; then
+	 failure
+	 echo
+	 die "unable to determine GPFS daemon status!"
+      fi
+      state=$(echo "$status" | awk '{print $3}')
+      if [ "$state" == 'active' -o "$state" == 'arbitrating' ]; then
+	 echo -n $"$state "
+	 passed
+	 echo
+      else
+	 strerror=$(mmstartup -N "$NodeName" 2>&1)
+	 if [ $? -eq 0 ]; then
+	    while [ 1 ]; do
+	       state=$(mmgetstate -N "$NodeName" 2>&1 |                \
+		  grep -E "[[:space:]]+${NodeName%%\.*}[[:space:]]+" | \
+		  awk '{print $3}'                                     \
+	       )
+	       if [ "$state" == 'active' -o "$state" == 'arbitrating' ]; then
+		  echo -n $"$state "
+		  break
+	       fi
+	       sleep 1
+	    done
+	    success
+	    echo
+	 else
+	    warning
+	    echo
+	    warn "$strerror"
+	    block "mmstartup -N $NodeName"
+	 fi
+      fi
+   done
+
+   return 0
+}
+
+do_activate_member_gpfsd() {
+   echo -n $"      Activating GPFS daemon: "
+   local NodeName="$1" state= status= strerror=
+
+   status=$(mmgetstate -N "$NodeName" 2>&1 |             \
+      grep -E "[[:space:]]+${NodeName%%\.*}[[:space:]]+" \
+   )
+   if [ $? -ne 0 ]; then
+      failure
+      echo
+      warn "unable to determine GPFS daemon status!"
+      return 1
+   fi
+   state=$(echo "$status" | awk '{print $3}')
+   if [ "$state" == 'active' -o "$state" == 'arbitrating' ]; then
+      echo -n $"$state "
+      passed
+      echo
+   else
+      strerror=$(mmstartup -N "$NodeName" 2>&1)
+      if [ $? -eq 0 ]; then
+	 while [ 1 ]; do
+	    state=$(mmgetstate -N "$NodeName" 2>&1 |                \
+	       grep -E "[[:space:]]+${NodeName%%\.*}[[:space:]]+" | \
+	       awk '{print $3}'                                     \
+	    )
+	    if [ "$state" == 'active' -o "$state" == 'arbitrating' ]; then
+	       echo -n $"$state "
+	       break
+	    fi
+	    sleep 1
+	 done
+	 success
+	 echo
+      else
+	 warning
+	 echo
+	 warn "$strerror"
+	 return 1
+      fi
+   fi
+
+   return 0
+}
+
+do_assign_gpfs_offline_attributes() {
+   echo $"   Assigning Offline GPFS attributes: "
+   local state= status= strerror=
+
+   do_deactivate_gpfsd '   '
+
+   # MaxBlockSize
+   if [ -n "$BlockSize" ]; then
+      echo -n $"      MaxBlockSize: $BlockSize "
+      status=$(mmlsconfig maxblocksize 2>&1)
+      if [ $? -ne 0 ]; then
+	 failure
+	 echo
+	 warn "$status"
+	 warn "unable to exec 'mmlsconfig maxblocksize'!"
+      else
+	 state=$(echo "$status" | awk 'BEGIN{IGNORECASE = 1} /^maxblocksize/ {print $2; exit}')
+	 if [ "$state" == "$BlockSize" ]; then
+	    passed
+	    echo
+	 else
+	    strerror=$(mmchconfig maxblocksize="$BlockSize" 2>&1)
+	    if [ $? -eq 0 ]; then
+	       success
+	       echo
+	    else
+	       failure
+	       echo
+	       warn "$strerror"
+	    fi
+	 fi
+      fi
+   fi
+
+   return 0
+}
+
+do_assign_gpfs_attributes() {
+   echo $"   Assigning Online GPFS attributes: "
+   local state= status= strerror=
+
+   # MaxFilesToCache
+   if [ -n "$MaxFilesToCache" ]; then
+      echo -n $"      MaxFilesToCache: $MaxFilesToCache "
+      status=$(mmlsconfig maxFilesToCache 2>&1)
+      if [ $? -ne 0 ]; then
+	 failure
+	 echo
+	 warn "$status"
+	 warn "unable to exec 'mmlsconfig maxFilesToCache'!"
+      else
+	 state=$(echo "$status" | awk 'BEGIN{IGNORECASE = 1} /^maxFilesToCache/ {print $2; exit}')
+	 if [ "$state" == "$MaxFilesToCache" ]; then
+	    passed
+	    echo
+	 else
+	    strerror=$(mmchconfig maxFilesToCache="$MaxFilesToCache" 2>&1)
+	    if [ $? -eq 0 ]; then
+	       success
+	       echo
+	    else
+	       failure
+	       echo
+	       warn "$strerror"
+	    fi
+	 fi
+      fi
+   fi
+
+   # MaxMBpS
+   if [ -n "$MaxMBpS" ]; then
+      echo -n $"      MaxMBpS: $MaxMBpS "
+      status=$(mmlsconfig maxMBpS 2>&1)
+      if [ $? -ne 0 ]; then
+	 failure
+	 echo
+	 warn "$status"
+	 warn "unable to exec 'mmlsconfig maxMBpS'!"
+      else
+	 state=$(echo "$status" | awk 'BEGIN{IGNORECASE = 1} /^maxMBpS/ {print $2; exit}')
+	 if [ "$state" == "$MaxMBpS" ]; then
+	    passed
+	    echo
+	 else
+	    strerror=$(mmchconfig maxMBpS="$MaxMBpS" -i 2>&1)
+	    if [ $? -eq 0 ]; then
+	       success
+	       echo
+	    else
+	       failure
+	       echo
+	       warn "$strerror"
+	    fi
+	 fi
+      fi
+   fi
+
+   # MaxStatCache
+   if [ -n "$MaxStatCache" ]; then
+      echo -n $"      MaxStatCache: $MaxStatCache "
+      status=$(mmlsconfig maxStatCache 2>&1)
+      if [ $? -ne 0 ]; then
+	 failure
+	 echo
+	 warn "$status"
+	 warn "unable to exec 'mmlsconfig maxStatCache'!"
+      else
+	 state=$(echo "$status" | awk 'BEGIN{IGNORECASE = 1} /^maxStatCache/ {print $2; exit}')
+	 if [ "$state" == "$MaxStatCache" ]; then
+	    passed
+	    echo
+	 else
+	    strerror=$(mmchconfig maxStatCache="$MaxStatCache" 2>&1)
+	    if [ $? -eq 0 ]; then
+	       success
+	       echo
+	    else
+	       failure
+	       echo
+	       warn "$strerror"
+	    fi
+	 fi
+      fi
+   fi
+
+   # PagePool
+   if [ -n "$PagePool" ]; then
+      echo -n $"      PagePool: $PagePool "
+      status=$(mmlsconfig pagepool 2>&1)
+      if [ $? -ne 0 ]; then
+	 failure
+	 echo
+	 warn "$status"
+	 warn "unable to exec 'mmlsconfig pagepool'!"
+      else
+	 state=$(echo "$status" | awk 'BEGIN{IGNORECASE = 1} /^pagepool/ {print $2; exit}')
+	 if [ "$state" == "$PagePool" ]; then
+	    passed
+	    echo
+	 else
+	    strerror=$(mmchconfig pagepool="$PagePool" -i 2>&1)
+	    if [ $? -eq 0 ]; then
+	       success
+	       echo
+	    else
+	       failure
+	       echo
+	       warn "$strerror"
+	    fi
+	 fi
+      fi
+   fi
+
+   return 0
+}
+
+do_deactivate_gpfsd() {
+   echo -n $"$1   De-activating GPFS daemons: "
+   local strerror=
+
+   strerror=$(mmshutdown -a 2>&1)
+   if [ $? -ne 0 ]; then
+      warning
+      echo
+      warn "$strerror"
+      warn "unable to exec 'mmshutdown -a'!"
+   else
+      success
+      echo
+   fi
+
+   return 0
+}
+
+do_rescan_scsi() {
+   echo $"   Re-scanning SCSI devices: "
+   local NodeName= strerror=
+
+   for NodeName in "${!NodeDesc[@]}"; do
+      echo -n $"      $NodeName: "
+      strerror=$(ssh -nx "$NodeName" '/usr/bin/scsi-rescan 2>&1' 2>&1)
+      if [ $? -ne 0 ]; then
+	 warning
+	 echo
+	 warn "$strerror"
+	 warn "unable to exec 'ssh "$NodeName" /usr/bin/scsi-rescan'!"
+      else
+	 success
+	 echo
+      fi
+   done
+
+   return 0
+}
+
+do_initialize_config() {
+   echo $"   Initializing GPFS configuration: "
+   local NodeName= strerror=
+
+   for NodeName in "${!NodeDesc[@]}"; do
+      echo -n $"      $NodeName: "
+      strerror=$(ssh -nx "$NodeName" '/bin/find /var/mmfs -not -type d -delete 2>&1' 2>&1)
+      if [ $? -ne 0 ]; then
+	 warning
+	 echo
+	 warn "$strerror"
+	 warn "unable to exec 'ssh "$NodeName" /bin/find /var/mmfs -not -type d -delete'!"
+      else
+	 success
+	 echo
+      fi
+   done
+
+   return 0
+}
+
+# Examine system disks to identify any posessing a NSD signature.  If
+# found, seek a FS signature by which to import the configuration back into
+# GPFS.  In process, identify any "free" disks to be added to the
+# global/common storage pool at a later time.  Newly-created NSDs will
+# possess the PrimaryServer as their sole ServerList member; other
+# quorum-providing nodes will be configured to serve the NSDs in a
+# secondary operation.
+#
+# Return values:
+#    0 = GPFS '$Device' present
+#    1 = One or more NSDs possess a GPFS descriptor for '$Device'
+#  255 = No NSD possesses a GPFS descriptor for '$Device'
+do_discover_gpfs() {
+   echo -n $"   Discovering GPFS '$Device': "
+   local NodeName= disks= name= seq= servers= size= status= strerror= udevinfo=
+
+   mmlsfs "$Device" > /dev/null 2>&1
+   if [ $? -eq 0 ]; then
+      passed
+      echo
+      return 0
+   else
+
+      servers="$PrimaryServer,$SecondaryServer"
+      for NodeName in "${!NodeDesc[@]}"; do
+	 [[ "${NodeDesc[$NodeName]}" =~ 'nonquorum' ]] && continue
+	 [[ ! "${NodeDesc[$NodeName]}"  =~ 'quorum' ]] && continue
+	 [ "${NodeName%%\.*}" == "${PrimaryServer%%\.*}" ] && continue
+	 [ "${NodeName%%\.*}" == "${SecondaryServer%%\.*}" ] && continue
+	 servers="$servers,$NodeName"
+      done
+
+      disks=$(awk '/[[:space:]]+sd[^[:digit:]]+$/ \
+	 {                                        \
+	    if (NF > 3 && $3 > 1)                 \
+	       print $4                           \
+	 }' /proc/partitions 2>&1)
+
+      if [ $? -ne 0 ]; then
+	 failure
+	 echo
+	 warn $"$disks"
+	 die 'failed to enumerate /proc/partitions!'
+      fi
+
+      if [ -z "$disks" ]; then
+	 failure
+	 echo
+	 die 'failed to locate any locally-attached disk!'
+      fi
+      echo
+
+      udevinfo=$(type -p udevadm)
+      if [ $? -eq 0 ]; then
+	 udevinfo="$udevinfo info -q all -n"
+      else
+	 udevinfo=$(type -p udevinfo)
+	 [ $? -eq 0 ] && udevinfo="$udevinfo -q all -n"
+      fi
+
+      # Definitions for SG_DISKS lines (from mmglobfuncs):
+      # DISK_NAME_Field=5
+      # DISK_SIZE_Field=6
+      # FAILURE_GROUP_Field=7
+      # DISK_USAGE_Field=8
+      # PVID_Field=9
+      # DISK_TYPE_Field=10         # disk type (e.g., nsd, disk, lv)
+      # NSD_PRIMARY_NODE_Field=11
+      # NSD_BACKUP_NODE_Field=12
+      # DISK_SUBTYPE_Field=13      # ssa, pr, other; used for fencing
+      # VPATH_FLAG_Field=14        # vpath or notvpath; used when deleting or importing
+      #                            #   disks; SDD utilities may or may not be needed
+      # NSD_SUBTYPE_Field=15       # disk type of the disk underlying the nsd
+      #                            #   (e.g., vsd, lv, hdisk, vpath, generic)
+      # NAME_SOURCE_Field=16       # disk name source (user-specified or cmd-generated)
+      # NSD_SUBTYPE_DISKNAME_Field=17  #  disk name of the disk underlying the nsd
+      # EXCLUDE_Field=18
+      # PAXOS_Field=19
+      # DISK_STATUS_Field=20
+      # OS_PVID_Field=21           # PVID (if applicable).  Previously AIX_PVID_Field
+      # STORAGE_POOL_Field=22
+      # DAEMON_NSD_PRIMARY_Field=23
+      # DAEMON_NSD_BACKUP_Field=24
+      # available_Field=25
+      # available_Field=26
+      # available_Field=27
+
+      seq=0
+      while read disk; do
+	 grep -q "^/dev/$disk" '/proc/self/mounts' && continue
+	 echo -n $"      /dev/${disk}: "
+
+	 name=
+	 [ -n "$udevinfo" ] &&                 \
+	    name=$($udevinfo /dev/$disk 2>&1 | \
+	       awk -F= '/ID_SERIAL=/           \
+		  {                            \
+		     gsub(/\W+/,"_",$2);       \
+		     print $2;                 \
+		     exit                      \
+		  }'                           \
+	    )
+	 [ -z "$name" ] && name="n$disk"
+
+	 while [ 1 ]; do
+	    status=$(mmfsadm test readdescraw /dev/$disk 2>&1)
+	    [ $? -eq 0 ] && break
+	    sleep 1
+	 done
+	 echo "$status" | grep -m1 -q '^FS descriptor in'
+	 if [ $? -eq 0 ]; then
+	    let seq++
+	    size=$(cat /sys/block/${disk}/size 2>&1)
+	    if [ $? -ne 0 ]; then
+	       failure
+	       echo
+	       warn $"$size"
+	       die "unable to determine the size of /dev/$disk!"
+	    fi
+
+	    strerror=$(mmfsadm test readdescadmin /dev/$disk 2>&1)
+	    if [ $? -ne 0 ]; then
+	       warning
+	       echo
+	       warn "$strerror"
+	       block "mmfsadm test readdescadmin /dev/$disk"
+	    fi
+	    
+	    echo "$strerror" | awk '{print $1}' |    \
+	       awk -F: "BEGIN {OFS=\":\"}            \
+	       {                                     \
+		  sub(/.*/,\"$seq\",\$4);            \
+		  sub(/.*/,\"$name\",\$5);           \
+		  sub(/.*/,\"$size\",\$6);           \
+		  sub(/.*/,\"-1\",\$7);              \
+		  sub(/.*/,\"${servers#,}\",\$11);   \
+		  sub(/.*/,\"other\",\$13);          \
+		  sub(/.*/,\"generic\",\$15);        \
+		  sub(/.*/,\"user\",\$16);           \
+		  sub(/.*/,\"\",\$19);               \
+		  sub(/.*/,\"${servers#,}\",\$23);   \
+		  print $1                           \
+	       }" >> "$ImportfsFile"
+	    success
+	    echo
+	 else
+	    echo "${disk}:${PrimaryServer}::dataAndMetadata:-1:$name"  >> "$DescFile"
+	    echo "$status" | grep -m1 -q '^NSD descriptor in'
+	    if [ $? -eq 0 ]; then
+	       echo -n $'NSD possesses no FS descriptor: '
+	       warning
+	       echo
+	    else
+	       echo -n $'device possesses no NSD descriptor: '
+	       warning
+	       echo
+	    fi
+	 fi
+      done < <(echo "$disks")
+
+      [ $seq -eq 0 ] && return 255
+      return 1
+   fi
+}
+
+# Scan through system disks to identify any "free" disks to be added to the
+# global/common storage pool at a later time.  Newly configured NSDs will
+# possess the PrimaryServer as their sole ServerList member; other
+# quorum-providing nodes will be configured to serve the NSDs in a
+# secondary operation.
+do_scan_disks() {
+   echo -n $"   Scanning system disks: "
+   local NodeName= disks= name= status= udevinfo=
+
+   disks=$(awk '/[[:space:]]+sd[^[:digit:]]+$/ \
+      {                                        \
+	 if (NF > 3 && $3 > 1)                 \
+	    print $4                           \
+      }' /proc/partitions 2>&1)
+
+   if [ $? -ne 0 ]; then
+      warning
+      echo
+      warn $"$disks"
+      warn 'failed to enumerate /proc/partitions!'
+      return 1
+   fi
+
+   if [ -z "$disks" ]; then
+      warning
+      echo
+      warn 'failed to locate any locally-attached disk!'
+      return 1
+   fi
+   echo
+
+   udevinfo=$(type -p udevadm)
+   if [ $? -eq 0 ]; then
+      udevinfo="$udevinfo info -q all -n"
+   else
+      udevinfo=$(type -p udevinfo)
+      [ $? -eq 0 ] && udevinfo="$udevinfo -q all -n"
+   fi
+
+   while read disk; do
+      grep -q "^/dev/$disk" '/proc/self/mounts' && continue
+      echo -n $"      /dev/$disk: "
+
+      name=
+      [ -n "$udevinfo" ] &&                 \
+	 name=$($udevinfo /dev/$disk 2>&1 | \
+	    awk -F= '/ID_SERIAL=/           \
+	       {                            \
+		  gsub(/\W+/,"_",$2);       \
+		  print $2;                 \
+		  exit                      \
+	       }'                           \
+	 )
+      [ -z "$name" ] && name="n$disk"
+
+      while [ 1 ]; do
+	 status=$(mmfsadm test readdescraw /dev/$disk 2>&1)
+	 [ $? -eq 0 ] && break
+	 sleep 1
+      done
+      echo "$status" | grep -m1 -q '^FS descriptor in'
+      if [ $? -eq 0 ]; then
+	 echo -n $'bound: '
+	 passed
+	 echo
+      else
+	 echo "${disk}:${PrimaryServer}::dataAndMetadata:-1:$name"  >> "$DescFile"
+	 echo "$status" | grep -m1 -q '^NSD descriptor in'
+	 if [ $? -eq 0 ]; then
+	    echo -n $'free NSD: '
+	    success
+	    echo
+	 else
+	    echo -n $'free disk: '
+	    success
+	    echo
+	 fi
+      fi
+   done < <(echo "$disks")
+
+   return 0
+}
+
+# Add the least amount of configuration to the pre-populated $ImportfsFile
+# to make it suitable for mmimportfs.  It is here assumed that /dev/$Device
+# will be mounted on /gpfs/$Device with mount options rw,atime,mtime.
+do_assemble_gpfs() {
+   echo -n $"   Assembling GPFS '$Device': "
+   local strerror=
+
+   # Definitions for the VERSION_LINE (from mmglobfuncs):
+   # SDRFS_FORMAT_Field=4
+   # SDRFS_VERSION_Field=5
+   # SDRFS_GENNUM_Field=6
+   # RUNNING_CMD_Field=7
+   # CLUSTER_TYPE_Field=8
+   # PRIMARY_SERVER_Field=9
+   # BACKUP_SERVER_Field=10
+   # HIGHEST_GPFS_DISK_NBR_Field=11
+   # RSH_PATH_Field=12
+   # RCP_PATH_Field=13
+   # CLUSTERID_Field=14
+   # CLUSTER_SUBTYPE_Field=15
+   # GENNUM_TSTAMP_Field=16
+   # obsolete_Field=17          # old GETOBJECT_PORT_Field; reclaimed
+   # CLUSTER_NAME_Field=18
+   # NEW_KEY_Field=19
+   # SECLEVEL_Field=20
+   # COMMITTED_KEY_Field=21
+   # KEYFILE_FORMAT_Field=22
+   # available_Field=23
+   # available_Field=24
+   # DEFAULT_LOGIN_Field=25
+   # ADMIN_MODE_Field=26
+   # LICSTATE_Field=27
+
+   grep -m1 '00_VERSION_LINE' '/var/mmfs/gen/mmsdrfs'                         >> $ImportfsFile
+
+   # Definitions for SG_HEADR lines (from mmglobfuncs):
+   # DEV_MINOR_Field=5          # GPFS /dev/$Device always has block major = 239
+   # ODD_STATE_Field=6
+   # FS_TYPE_Field=7
+   # REMOTE_DEV_NAME_Field=8
+   # MOUNT_PRIORITY_Field=9
+   # RESERVED_Field=10
+   # STRIPE_METHOD_Field=11
+   # BLOCK_ALLOCATION_TYPE_Field=12
+   # DMAPI_ENABLED_Field=13
+   # available_Field=14 to 27
+
+   echo "%%home%%:30_SG_HEADR:${Device}::::::0::::no:::::::::::::::"          >> $ImportfsFile
+
+   # Definitions for SG_ETCFS lines (from mmglobfuncs):
+   # ETCFS_TEXT_Field=5
+   # MOUNT_POINT_Line=1
+   # DEV_Line=2
+   # VFS_Line=3
+   # NODENAME_Line=4
+   # MOUNT_Line=5
+   # TYPE_Line=6
+   # ACCOUNT_Line=7
+   # OPTIONS_Line=8
+   # DEV_Line_Prefix="       dev             = "
+   # VFS_Line_Prefix="       vfs             = "
+   # NODENAME_Line_Prefix="  nodename        = "
+   # MOUNT_Line_Prefix="     mount           = "
+   # TYPE_Line_Prefix="      type            = "
+   # ACCOUNT_Line_Prefix="   account         = "
+   # OPTIONS_Line_Prefix="   options         = "
+
+   echo "%%home%%:40_SG_ETCFS:${Device}:1:%2Fgpfs%2F${Device}:"                  >> $ImportfsFile
+   echo "%%home%%:40_SG_ETCFS:${Device}:2:	dev		= /dev/${Device}">> $ImportfsFile
+   echo "%%home%%:40_SG_ETCFS:${Device}:3:	vfs		= mmfs"          >> $ImportfsFile
+   echo "%%home%%:40_SG_ETCFS:${Device}:4:	nodename	= -"             >> $ImportfsFile
+   echo "%%home%%:40_SG_ETCFS:${Device}:5:	mount		= mmfs"          >> $ImportfsFile
+   echo "%%home%%:40_SG_ETCFS:${Device}:6:	type		= mmfs"          >> $ImportfsFile
+   echo "%%home%%:40_SG_ETCFS:${Device}:7:	account		= false"         >> $ImportfsFile
+
+   # Definitions for SG_MOUNT lines.
+   # RW_OPT_Field=5
+   # MTIME_OPT_Field=6
+   # ATIME_OPT_Field=7
+   # QUOTA_OPT_Field=8
+   # OTHER_OPT_Field=9
+   # DRIVE_LETTER_Field=10
+   # QUOTA_SCOPE_Field=11
+   # available_Field=12 to 27
+
+   echo "%%home%%:50_SG_MOUNT:${Device}::rw:mtime:atime:userquota;groupquota;filesetquota::::::::::::::::::::" >> $ImportfsFile
+
+   sort -n -t: -k2 -o $ImportfsFile $ImportfsFile
+
+   strerror=$(mmimportfs "$Device" -i "$ImportfsFile" 2>&1)
+   if [ $? -eq 0 ]; then
+      success
+      echo
+   else
+      warning
+      echo
+      warn "$strerror"
+      block "mmimportfs $Device -i $ImportfsFile"
+   fi
+}
+
+do_create_nsd() {
+   echo -n $"   Creating NSDs from free disks: "
+   local strerror=
+
+   strerror=$(mmcrnsd -F "$DescFile" -v no 2>&1)	# modifies $DescFile
+   if [ $? -eq 0 ]; then
+      success
+      echo
+      return 0
+   else
+      failure
+      echo
+      warn "$strerror"
+      warn "failed to exec 'mmcrnsd -F "$DescFile" -v no'"
+      return 1
+   fi
+}
+
+do_add_disk() {
+   echo -n $"   Adding free disks to GPFS '$Device': "
+   local strerror=
+
+   strerror=$(mmadddisk "$Device" -F "$DescFile" 2>&1)
+   if [ $? -eq 0 ]; then
+      success
+      echo
+      return 0
+   else
+      failure
+      echo
+      warn "$strerror"
+      warn "failed to exec 'mmadddisk -F $DescFile'"
+      return 1
+   fi
+}
+
+do_assign_nsd_servers() {
+   echo -n $"   Assigning NSD servers: "
+   local RETVAL=0 DiskName= ServerList= servers= state= status= strerror=
+
+   servers="$PrimaryServer,$SecondaryServer"
+   for NodeName in "${!NodeDesc[@]}"; do
+      [[ "${NodeDesc[$NodeName]}" =~ 'nonquorum' ]] && continue
+      [[ ! "${NodeDesc[$NodeName]}"  =~ 'quorum' ]] && continue
+      [ "${NodeName%%\.*}" == "${PrimaryServer%%\.*}" ] && continue
+      [ "${NodeName%%\.*}" == "${SecondaryServer%%\.*}" ] && continue
+      servers="$servers,$NodeName"
+   done
+
+   status=$(mmlsnsd 2>&1)
+   if [ $? -ne 0 ]; then
+      failure
+      echo
+      warn $"$status"
+      warn "failed to exec 'mmlsnsd'!"
+      return 1
+   fi
+
+   state=$(echo "$status" | awk "/\y${PrimaryServer}\y/ \
+      {                                                 \
+	 print \$(NF-1), \$NF                           \
+      }")
+
+   if [ -z "$state" ]; then
+      warning
+      echo
+      warn 'failed to locate any configured NSD!'
+      return 1
+   fi
+   echo
+
+   while read DiskName ServerList; do
+      echo -n $"      ${DiskName}: "
+      if [ "$ServerList" == "${servers#,}" ]; then
+	 passed
+	 echo
+      else
+	 mmumount $Device -a > /dev/null 2>&1
+	 strerror=$(mmchnsd "${DiskName}:${servers#,}" 2>&1)
+	 if [ $? -eq 0 ]; then
+	    success
+	    echo
+	 else
+	    failure
+	    echo
+	    warn "$strerror"
+	    warn "failed to exec 'mmchnsd ${DiskName}:${servers#,}'"
+	    RETVAL=1
+	 fi
+      fi
+   done < <(echo "$state")
+
+   return $RETVAL
+}
+
+do_create_gpfs() {
+   echo -n $"   Creating GPFS '$Device': "
+   local args= strerror=
+
+   args="-F $DescFile -A yes -D posix -E yes -k posix --mount-priority 0 -Q yes -S no -T /gpfs/$Device -z no"
+   [ -n "$BlockSize" ] && args="$args -B $BlockSize"
+
+   strerror=$(mmcrfs "$Device" $args 2>&1)
+   if [ $? -eq 0 ]; then
+      success
+      echo
+   else
+      warning
+      echo
+      warn "$strerror"
+      block "mmcrfs $Device $args"
+   fi
+}
+
+do_assign_quorumdisk() {
+   echo -n $"   Assigning a quorum disk: "
+   local DiskName= state= status= strerror=
+
+   status=$(mmlsconfig tiebreakerDisks 2>&1)
+   if [ $? -ne 0 ]; then
+      failure
+      echo
+      warn "$status"
+      warn "unable to exec 'mmlsconfig tiebreakerDisks', skipping quorum disk assignment!"
+      return 1
+   fi
+   state=$(echo "$status" | awk 'BEGIN{IGNORECASE = 1} /^tiebreakerDisks/ {print $2; exit}')
+   if [[ -n "$state" && ! "$state" =~ 'undefined' ]]; then
+      echo -n $"$state "
+      passed
+      echo
+   else
+      echo
+      do_deactivate_gpfsd '   '
+
+      DiskName=$(mmlsnsd -f $Device 2>&1 | awk "/\y$Device\y/ \
+	 {                                                    \
+	    print \$2;                                        \
+	    exit                                              \
+	 }")
+      if [ -z "$DiskName" ]; then
+	 warn "failed to identify any '$Device' NSD, skipping quorum disk assignment!"
+	 do_activate_quorum_gpfsd '   '
+	 return 1
+      fi
+
+      echo -n $"      Quorum disk: "
+      strerror=$(mmchconfig tiebreakerDisks=$DiskName 2>&1)
+      if [ $? -eq 0 ]; then
+	 echo -n $"${DiskName}: "
+	 success
+	 echo
+      else
+	 warning
+	 echo
+	 warn "$strerror"
+	 warn "failed to exec 'mmchconfig tiebreakerDisks=$DiskName', skipping quorum disk assignment!"
+	 do_activate_quorum_gpfsd '   '
+	 return 1
+      fi
+
+      do_activate_quorum_gpfsd '   '
+   fi
+}
+
+do_mount_quorum_gpfs() {
+   echo $"   Mounting GPFS '$Device': "
+   local NodeName= status= strerror=
+
+   for NodeName in "${!NodeDesc[@]}"; do
+      [[ "${NodeDesc[$NodeName]}" =~ 'nonquorum' ]] && continue
+      [[ ! "${NodeDesc[$NodeName]}" =~  'quorum' ]] && continue
+      echo -n $"      $NodeName: "
+      status=$(mmlsmount "$Device" -L 2>&1 |                  \
+	 grep -iv 'internal' |                                \
+	 grep -E  "[[:space:]]+${NodeName%%\.*}[[:space:]]*$" \
+      )
+      if [ $? -eq 0 ]; then
+	 passed
+	 echo
+      else
+	 strerror=$(mmmount "$Device" -N "$NodeName" 2>&1)
+	 if [ $? -eq 0 ]; then
+	    success
+	    echo
+	 else
+	    warning
+	    echo
+	    warn "$strerror"
+	    block "mmmount $Device -N $NodeName"
+	 fi
+      fi
+   done
+}
+
+do_mount_member_gpfs() {
+   echo -n $"      Mounting GPFS '$Device': "
+   local NodeName="$1" status= strerror=
+
+   status=$(mmlsmount "$Device" -L 2>&1 |                  \
+      grep -iv 'internal' |                                \
+      grep -E  "[[:space:]]+${NodeName%%\.*}[[:space:]]*$" \
+   )
+   if [ $? -eq 0 ]; then
+      passed
+      echo
+   else
+      local nap=0
+      while [ 1 ]; do
+	 strerror=$(mmmount "$Device" -N "$NodeName" 2>&1)
+	 let nap+=2
+	 sleep $nap
+	 status=$(mmlsmount "$Device" -L 2>&1 |                  \
+	    grep -iv 'internal' |                                \
+	    grep -E  "[[:space:]]+${NodeName%%\.*}[[:space:]]*$" \
+	 )
+	 [ $? -eq 0 ] && break
+      done
+      success
+      echo
+   fi
+
+   return 0
+}
+
+do_umount_gpfs() {
+   echo -n $"   Unmounting GPFS '${Device}': "
+   local strerror=
+
+   strerror=$(mmumount $Device -a 2>&1)
+   if [ $? -ne 0 ]; then
+      warning
+      echo
+      warn "$strerror"
+      warn "unable to exec 'mmumount $Device -a'!"
+   else
+      success
+      echo
+   fi
+
+   return 0
+}
+
+do_restore_member() {
+   echo -n $"      Restoring GPFS member: "
+   local NodeName="$1" args= strerror=
+
+   [ -n "$RemoteFileCopyCommand" ] && args="-R $RemoteFileCopyCommand"
+   strerror=$(mmsdrrestore $args -N "$NodeName" 2>&1)
+   if [ $? -eq 0 ]; then
+      success
+      echo
+   else
+      warning
+      echo
+      warn "$strerror"
+      return 1
+   fi
+
+   return 0
+}
+
+do_associate_member() {
+   local hostname=$(hostname) strerror=
+
+   echo -n $"   Contacting primary GPFS server: "
+   strerror=$(ssh -nx "$PrimaryServer" '/bin/true' 2>&1)
+   if [ $? -eq 0 ]; then
+      success
+      echo
+   else
+      warning
+      echo
+      warn "unable to exec 'ssh $PrimaryServer /bin/true': ${strerror}!"
+      block "ssh -nx $PrimaryServer /bin/true"
+   fi
+
+   echo -n $"   Requesting cluster association: "
+   strerror=$(ssh -nx "$PrimaryServer" "/etc/init.d/autogpfs assimilate ${hostname%%\.*} 2>&1" 2>&1)
+   if [ $? -eq 0 ]; then
+      success
+      echo
+   else
+      failure
+      echo
+      warn "unable to exec 'ssh $PrimaryServer /etc/init.d/autogpfs assimilate ${hostname%%\.*}'!"
+      STATUS=-1
+   fi
+   echo "$strerror"
+}
+
+start() {
+   echo -n $"Starting $prog: "
+   local NodeName= quorum= PSIP=
+
+   echo $$ > $pidfile
+
+   # Only run if gpfs is scheduled to start
+   chkconfig gpfs
+   if [ $? -ne 0 ]; then
+      success
+      echo
+      do_exit
+   fi
+
+   # Ensure that a GPFS PrimaryServer is defined
+   if [ -z "$PrimaryServer" ]; then
+      failure
+      echo
+      die "'\$PrimaryServer' is not defined in $config!"
+   fi
+
+   # Ensure that this program only runs on the PrimaryServer node
+   PSIP=$(getent ahostsv4 $PrimaryServer | awk 'NR==1 {print $1}')
+   if [ -z "$PSIP" ]; then
+      failure
+      echo
+      die "unable to determine the primary server's ($PrimaryServer) IP!"
+   fi
+   ip -o -4 addr show | grep -m1 -q -E "[[:space:]]+${PSIP}/"
+   if [ $? -ne 0 ]; then
+      echo
+      do_associate_member
+      do_exit
+   fi
+
+   # Ensure that a GPFS SecondaryServer is defined
+   if [ -z "\$SecondaryServer" ]; then
+      failure
+      echo
+      die "'\$SecondaryServer' is not defined in $config!"
+   fi
+
+   # Ensure that a GPFS NodeDesc is defined
+   if [ ${#NodeDesc[@]} -eq 0 ]; then
+      failure
+      echo
+      die "'%NodeDesc' is not defined in $config!"
+   fi
+
+   echo
+
+   do_contact_quorum
+   do_create_cluster
+   do_assign_quorum_licenses
+   do_assign_gpfs_offline_attributes
+   do_activate_quorum_gpfsd
+   do_assign_gpfs_attributes
+   do_discover_gpfs; RETVAL=$?
+
+   if [ $RETVAL -eq 1 ]; then
+      do_assemble_gpfs
+      if [ -e "$DescFile" ]; then
+	 do_create_nsd
+	 if [ $? -eq 0 ]; then
+	    do_add_disk
+	    [ $? -ne 0 ] && STATUS=-1
+	 else
+	    STATUS=-1
+	 fi
+      fi
+   elif [ $RETVAL -eq 255 ]; then
+      if [ -e "$DescFile" ]; then
+	 do_create_nsd
+	 if [ $? -eq 0 ]; then
+	    do_create_gpfs
+	 else
+	    die "failed to write NSD descriptors onto all system disks!"
+	 fi
+      else
+	 die "no system disk is available to home a GPFS!"
+      fi
+   fi
+
+   do_assign_nsd_servers
+   [ $? -ne 0 ] && STATUS=-1
+
+   if [ ${UseQuorumTiebreaker:-'2'} -gt 0 ]; then		# default: 2
+      if [ ${UseQuorumTiebreaker:-'2'} -eq 1 ]; then		# default: 2
+	 do_assign_quorumdisk
+      else
+	 quorum=0
+	 for NodeName in "${!NodeDesc[@]}"; do
+	    [[ "${NodeDesc[$NodeName]}" =~ 'nonquorum' ]] && continue
+	    [[ "${NodeDesc[$NodeName]}" =~ 'quorum' ]] && let quorum++
+	 done
+	 [ $quorum -le ${UseQuorumTiebreaker:-'2'} ] && do_assign_quorumdisk
+      fi
+   fi
+
+   do_mount_quorum_gpfs
+
+   touch $lockfile	# nodes providing quorum have been successfully configured!
+
+   # Assimilate non-quorum nodes, if possible
+   for NodeName in "${!NodeDesc[@]}"; do
+      if [[ "${NodeDesc[$NodeName]}" =~ 'nonquorum' ]]; then
+	 assimilate "$NodeName"
+	 [ $? -ne 0 ] && STATUS=-1
+      elif [[ ! "${NodeDesc[$NodeName]}" =~ 'quorum' ]]; then
+	 assimilate "$NodeName"
+	 [ $? -ne 0 ] && STATUS=-1
+      fi
+   done
+   do_exit
+}
+
+stop() {
+   echo -n $"Stopping $prog: "
+   local strerror=
+
+   [ -f "$pidfile" ] && strerror=$(killproc -p "$pidfile" "$prog")
+   rm -f "$lockfile"
+   success
+   echo
+
+   return 0
+}
+
+restart() {
+   local PSIP=
+
+   stop
+
+   # Ensure that a GPFS NodeDesc is defined
+   if [ ${#NodeDesc[@]} -eq 0 ]; then
+      failure
+      echo
+      warn "'%NodeDesc' is not defined in $config!"
+      STATUS=-1
+      return 1
+   fi
+
+   # Ensure that this program only runs on the PrimaryServer node
+   PSIP=$(getent ahostsv4 $PrimaryServer | awk 'NR==1 {print $1}')
+   if [ -z "$PSIP" ]; then
+      failure
+      echo
+      warn "unable to determine the primary server's ($PrimaryServer) IP!"
+      STATUS=-1
+      return 1
+   fi
+   ip -o -4 addr show | grep -m1 -q -E "[[:space:]]+${PSIP}/"
+   if [ $? -ne 0 ]; then
+      success
+      echo
+      do_exit
+   fi
+
+   do_deactivate_gpfsd
+   do_rescan_scsi
+   do_initialize_config
+   echo
+
+   start
+}
+
+assimilate() {
+   local NodeName= node="$1" state= status=
+
+   [ -z "$node" ] && return 0
+
+   for NodeName in "${!NodeDesc[@]}"; do
+      if [ "${node%%\.*}" == "${NodeName%%\.*}" ]; then
+	 echo -n $"   Assimilating $NodeName: "
+
+	 state=$(status -p "$pidfile" -l "$lockfile" $prog)
+	 if [ $? -eq 0 -a ! -e "$lockfile" ]; then
+	    passed
+	    echo
+	    return 0
+	 fi
+	 echo
+
+	 status=$(mmlscluster 2>&1 |                      \
+	    grep -E "[[:space:]]+${NodeName}[[:space:]]+" \
+	 )
+	 if [ $? -eq 0 ]; then	# $NodeName is already a member of this cluster
+
+	    do_contact_member "${NodeName}"
+	    [ $? -ne 0 ] && return 1
+
+	    do_restore_member "${NodeName}"
+	    [ $? -ne 0 ] && return 1
+
+	 else			# $NodeName is not yet a member of this cluster
+
+	    do_contact_member "${NodeName}"
+	    [ $? -ne 0 ] && return 1
+
+	    do_add_member "${NodeName}"
+	    [ $? -ne 0 ] && return 1
+
+	    do_assign_member_license "${NodeName}"
+	    [ $? -ne 0 ] && return 1
+
+	 fi
+
+	 do_activate_member_gpfsd "${NodeName}"
+	 [ $? -ne 0 ] && return 1
+
+	 do_mount_member_gpfs "${NodeName}"
+
+         break
+      fi
+
+   done
+
+   return 0
+
+}
+
+rebind() {
+   echo $"Binding free system disks: "
+
+   do_rescan_scsi
+   do_scan_disks
+
+   if [ $? -eq 0 -a -e "$DescFile" ]; then
+      do_create_nsd
+      if [ $? -eq 0 ]; then
+	 do_add_disk
+	 [ $? -ne 0 ] && STATUS=-1
+      else
+	 STATUS=-1
+      fi
+   fi
+   do_exit
+}
+
+destroy() {
+   echo -n $"Destroying GPFS data on all system drives: Proceed? [Ny]? "
+   local answer= block_size= disks= strerror=
+
+   read answer
+
+   [ "$answer" != 'y' -a "$answer" != 'Y' ] && return 0
+
+   do_umount_gpfs
+
+   echo $"   Initializing disk sectors: "
+
+   disks=$(awk '/[[:space:]]+sd[^[:digit:]]+$/ \
+      {                                        \
+	 if (NF > 3 && $3 > 1)                 \
+	    print $4                           \
+      }' /proc/partitions 2>&1)
+
+   if [ $? -ne 0 ]; then
+      warning
+      echo
+      warn $"$disks"
+      warn 'failed to enumerate /proc/partitions!'
+      return 1
+   fi
+
+   if [ -z "$disks" ]; then
+      warning
+      echo
+      warn 'failed to locate any locally-attached disk!'
+      return 1
+   fi
+
+   while read disk; do
+      grep -q "^/dev/$disk" '/proc/self/mounts' && continue
+      echo -n $"      /dev/$disk: "
+      block_size=$(cat /sys/block/${disk}/queue/physical_block_size 2>&1)
+      if [ $? -ne 0 ]; then
+	 warning
+	 echo
+	 warn $"$block_size"
+	 warn "unable to determine the block size of /dev/$disk, skipping!"
+	 continue
+      fi
+      strerror=$(dd if=/dev/zero of=/dev/$disk bs=$block_size count=10 2>&1)
+      if [ $? -eq 0 ]; then
+	 success
+	 echo
+      else
+	 warning
+	 echo
+	 warn $"$strerror"
+	 warn "unable to exec 'dd if=/dev/zero of=/dev/$disk bs=$block_size count=10', skipping!"
+	 continue
+      fi
+   done < <(echo "$disks")
+
+   return 0
+}
+
+case "$1" in
+   start)
+      start
+      ;;
+
+   stop)
+      stop
+      ;;
+
+   restart)
+      restart
+      ;;
+
+   status)
+      status -p "$pidfile" -l "$lockfile" $prog
+      STATUS=$?
+      ;;
+
+   assimilate|recover|restore)
+      assimilate "$2"
+      ;;
+
+   bind|rebind|redisk|redrive)
+      rebind
+      ;;
+
+   destroy)
+      destroy
+      ;;
+
+   *)
+      echo $"Usage: $prog {start|stop|restart|status}"
+      echo $"       $prog {bind|rebind|redisk|redrive}"
+      echo $"       $prog {assimilate|recover|restore} <node>"
+esac
+
+exit $STATUS

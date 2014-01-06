@@ -1,0 +1,181 @@
+# $Header: /away/cfengine/product_cg/vnfs/common/rootfs/etc/sysconfig/RCS/autogpfs,v 1.20 2013/11/01 18:52:41 ben Exp $
+#
+##################
+# GPFS configuration variables.  All hostnames defined herein must refer to
+# the communication adapter over which GPFS daemons communicate; aliased
+# interfaces are not allowed.  Regardless of whether you use a node's short
+# hostname or FQDN, GPFS commands will resolve the input to a unique
+# hostname+IPaddr and will store these in its configuration files.
+#
+
+##################
+# Requirements/Assumptions:
+#
+# 1. Root authority is required to perform all GPFS administration tasks.
+#    In principle, you can issue GPFS administration commands from any node
+#    in the cluster. The nodes that you plan to use for administering GPFS
+#    must be able to execute remote shell commands on any other node in the
+#    cluster without the use of a password and without producing any
+#    extraneous messages.  Similarly, the nodes on which the GPFS commands
+#    are issued must be able to copy files to and from any other node in
+#    the cluster without the use of a password and without producing any
+#    extraneous messages.  Said authority must be configured a priori to
+#    using autogpfs.
+#
+# 2. The PrimaryServer and SecondaryServer nodes must be capable of being
+#    Network Shared Disk (NSD) servers and provide quorum for the cluster.
+#
+# 3. There may be a minimum of two - and maximum of eight - quorum nodes;
+#    you may define an unlimited number of non-quorum nodes.
+#
+# 4. Every quorum node MUST have local/SAN access to ALL of the
+#    common/global disks, which appear in /proc/partitions as 'sd?'.
+#
+# 5. The PrimaryServer node MUST have local/SAN access to NO other disk(s)
+#    that appear in /proc/partitions as 'sd?' other than those in the
+#    common/global storage pool.
+#
+# 6. Any "free" disk thus seen by the the PrimaryServer will be
+#    automatically configured as an NSD for GPFS' use, then added to the
+#    common/global storage pool.  Each NSD's initial ServerList will be
+#    solely comprised of the PrimaryServer node to avoid conflicts caused
+#    by the variability in device names assigned by quorum nodes when they
+#    boot.  The full ServerList will be configured in a secondary step.
+#
+# 7. NSDs will be configured to have the PrimaryServer and SecondaryServer
+#    in first and second positions, respectively, of the ServerList; these
+#    will be followed by additional quorum nodes, if any.  All NSDs are
+#    assumed to contain both data and metadata with failure group '-1' to
+#    indicate that the given disk has NO point of failure in common with
+#    any other disk.  All NSDs will be assigned to the default system pool.
+#
+# 8. The GPFS file system will be created with the following defaults:
+#    - to be mounted when the GPFS daemon starts (-A yes)
+#    - to allow NFS writes in the presence of a deny-write open lock (-D posix)
+#    - to report exact mtime values (-E yes)
+#    - to only support traditional GPFS ACLs; no NFSv4/Windows ACLs (-k posix)
+#    - to enable quotas (-Q yes)
+#    - to periodically update atime values (-S no)
+#    - to disable DMAPI (-z no)
+#    - to have blocksize $BlockSize (-B $BlockSize)
+#
+
+UseQuorumTiebreaker=1	# a tiebreaker disk controls whether GPFS will use
+			# the node quorum with tiebreaker algorithm in
+			# place of the regular node based quorum algorithm.
+			#    0 => never assign a tiebreaker disk
+			#    1 => always assign a tiebreaker disk
+			#  N>1 => assign a tiebreaker disk iff there are
+			#         no more than N quorum-providing nodes
+			# Default: 2
+
+TimeOut=10		# retry blocked commands this often (sec)
+
+##################
+# GPFS mmcrcluster definitions:
+#
+#    ClusterName	Specifies a name for the cluster. If the user-
+#			provided name contains dots, it is assumed to be a
+#			fully qualified domain name.  Otherwise, to make
+#			the cluster name unique, the domain of the primary
+#			configuration server will be appended to the
+#			user-provided name.
+#
+#    PrimaryServer	Specifies the primary GPFS cluster configuration
+#			server node used to store the GPFS configuration
+#			data. This node must be a member of the GPFS
+#			cluster.  This variable is MANDATORY to autogpfs
+#			and must be a node (hostname) which provides quorum!
+#
+#    SecondaryServer	Specifies the secondary GPFS cluster configuration
+#			server node used to store the GPFS cluster data.
+#			This node must be a member of the GPFS cluster.
+#			This variable is MANDATORY to autogpfs and must be
+#			a node (hostname) which provides quorum!
+#
+#    RemoteFileCopy	Specifies the fully-qualified path name for the
+#			remote file copy program to be used by GPFS.  The
+#			default value is /usr/bin/rcp.
+#
+#    RemoteShellCommand	Specifies the fully-qualified path name for the
+#			remote shell program to be used by GPFS. The
+#			default value is /usr/bin/rsh.
+#
+#    NodeDesc		Bash associative array specifying a node
+#			description of the form:
+#
+#			   NodeDesc[NodeName]='NodeDesignation'
+#
+#			where
+#
+#			   NodeName is a hostname
+#
+#			and
+#
+#			   NodeDesignation = <manager|client>-<quorum|nonquorum>
+#
+#			The PrimaryServer and SecondaryServer nodes MUST
+#			be keys in the NodeDesc definition, each having
+#			NodeDesignation value 'manager-quorum' respectively.
+#
+ClusterName='Campaign'
+PrimaryServer='cg01.localdomain'
+SecondaryServer='cg02.localdomain'
+RemoteShellCommand='/usr/bin/ssh'
+RemoteFileCopyCommand='/usr/bin/scp'
+
+declare -A NodeDesc					# bash associative array
+NodeDesc["$PrimaryServer"]='manager-quorum'		# MANDATORY!  DO NOT omit/change this!
+NodeDesc["$SecondaryServer"]='manager-quorum'		# MANDATORY!  DO NOT omit/change this!
+NodeDesc['cg03.localdomain']='client-nonquorum'
+NodeDesc['cg04.localdomain']='client-nonquorum'
+NodeDesc['cg05.localdomain']='client-nonquorum'
+NodeDesc['cg06.localdomain']='client-nonquorum'
+
+
+##################
+# GPFS performance tuning:
+#
+#    MaxFilesToCache	Specify the number of inodes to cache for recently
+#			used files that have been closed (default: 1000).
+#			Increasing this number may improve throughput for
+#			workloads with high file reuse. However, increasing
+#			this number excessively may cause paging at the
+#			file system manager node.  The value should be
+#			large enough to handle the number of concurrently
+#			open files plus allow caching of recently used
+#			files.
+#
+#    MaxMBpS		Specify an estimate of how many megabytes of data
+#			can be transferred, per second, in/out of a single
+#			node (default: 150 MB/s).  The value is used in
+#			calculating the amount of I/O that can be done to
+#			effectively prefetch data for readers and
+#			write-behind data from writers.  By lowering this
+#			value, you can artificially limit how much I/O one
+#			node can put on all of the disk servers.  Training
+#			manual suggests setting this to twice the throughput
+#			required for the system.
+#
+#    MaxStatCache	Specify the number of inodes to keep in the stat
+#			cache (default: 4*maxFilesToCache).  The stat cache
+#			maintains only enough inode information to perform
+#			a query on the file system.
+#
+#    PagePool		Opportunistically set the pinned buffer cache to
+#			this size on each node (default: 64MB; min: 4MB;
+#			max: 75% memory).  Values can be suffixed with K,
+#			M, or G.  Training manual suggests the default is
+#			always too small.
+#
+#    maxblocksize       Changes the maximum file system block size.  Valid 
+#                       values are 64 KiB, 256 KiB, 512 KiB, 1 MiB, 2 MiB, 
+#                       4 MiB, 8 MiB (for GPFS Native RAID only), and 16 MiB 
+#                       (for GPFS Native RAID only). The default  value is 
+#                       1 MiB. Specify this value with the character K or M, 
+#                       for example 512K.
+#
+PagePool='8G'
+MaxMBpS='2048'
+MaxStatCache='100000'
+BlockSize='4M'		# 16K, 64K, 128K, 256K*, 512K, 1M, 2M, 4M
