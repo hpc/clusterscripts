@@ -1,0 +1,146 @@
+#!/bin/bash
+#
+# rPaNFS - require PaNFS mounts
+#
+# chkconfig: 345 62 24
+# description: block until all PaNFS mounts listed in /etc/fstab are satisfied
+#
+### BEGIN INIT INFO
+# Provides:          rpanfs
+# Required-Start:    $local_fs $syslog $network $panfs
+# Required-Stop:     $local_fs $syslog $network
+# Should-Start:
+# Should-Stop:
+# Default-Start:     3 5
+# Default-Stop:      0 1 6
+# Short-Description: block on PaNFS mounts
+# Description:       block until all PaNFS mounts listed in /etc/fstab are satisfied
+### END INIT INFO
+
+# Source the library functions
+. /etc/rc.d/init.d/functions
+
+RETVAL=0
+prog=rpanfs
+lockfile=/var/lock/subsys/$prog
+
+start() {
+   echo -n $"Starting $prog: "
+   success; echo
+
+   for mnt in $(grep -v '^#' /etc/fstab |  \
+      awk '/[[:space:]]+panfs[[:space:]]+/ \
+	 {                                 \
+	    if (NF > 3 && $3 eq "panfs")   \
+	       print $2                    \
+	 }')
+   do
+      NAP=0
+      while [ 1 ]; do
+	 echo -n $"   Waiting on '$mnt': "
+	 cat /proc/self/mounts | awk '{print $2}' | grep -qE "^${mnt}$"
+	 if [ $? -ne 0 ]; then		# not yet mounted
+	    STRERR=$(/bin/mount $mnt 2>&1)
+	    if [ $? -eq 0 ]; then
+	       passed; echo
+	       touch $lockfile
+	       break
+	    else
+	       echo -n $"$STRERR "
+	       failure; echo
+	       /usr/bin/logger -p daemon.err -t ${prog} -- $STRERR
+	       let NAP++
+	       sleep $NAP	# linear backoff
+	       continue
+	    fi
+	 else				# already mounted
+	    success; echo
+	    touch $lockfile
+	    break
+	 fi
+      done
+   done
+   return 0
+}
+
+signal_processes() {
+   for mnt in $(awk '/[[:space:]]+panfs[[:space:]]+/ \
+      {                                               \
+	 if ($3 eq "panfs")                          \
+	    print $2                                  \
+      }' /proc/self/mounts 2>&1)
+   do
+      lsof -t -n -c ^lsof +d "$mnt" | while read pid; do
+	 kill -s ${1:-'TERM'} "$pid"	# default: SIGTERM
+      done
+   done
+}
+
+stop() {
+   echo -n $"Stopping $prog: "
+   success; echo
+
+   signal_processes 'TERM'; sleep 2; signal_processes 'KILL'
+
+   for mnt in $(awk '/[[:space:]]+panfs[[:space:]]+/ \
+      {                                              \
+	 if ($3 eq "panfs")                          \
+	    print $2                                 \
+      }' /proc/self/mounts 2>&1)
+   do
+      echo -n $"   Unmounting '$mnt': "
+      STRERR=$(/bin/umount -v $mnt 2>&1)
+      if [ $? -eq 0 ]; then
+	 passed; echo
+      else
+	 echo -n $"$STRERR "
+	 failure; echo
+	 /usr/bin/logger -p daemon.err -t ${prog} -- $STRERR
+	 RETVAL=1;
+      fi
+   done
+
+   [ $RETVAL -eq 0 ] && rm -f $lockfile
+
+   return 0
+}
+
+status() {
+   for mnt in $(grep -v '^#' /etc/fstab |  \
+      awk '/[[:space:]]+panfs[[:space:]]+/ \
+	 {                                 \
+	    if (NF > 3 && $3 eq "panfs")   \
+	       print $2                    \
+	 }')
+   do
+      cat /proc/self/mounts | awk '{print $2}' | grep -qE "^${mnt}$"
+      if [ $? -ne 0 ]; then		# not yet mounted
+	 echo $"$mnt is NOT mounted!"
+	 RETVAL=1
+      else
+	 echo $"$mnt is mounted..."
+      fi
+   done
+   return 0
+}
+
+case "$1" in
+   start) 
+      start
+      ;;
+   stop)
+      stop
+      ;;
+   restart)
+      stop
+      start
+      ;;
+   status)
+      status
+      ;;
+   *)
+      echo "Usage: $0 {start|stop|restart|status}"
+      exit 1
+esac
+
+exit $RETVAL

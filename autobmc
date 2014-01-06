@@ -1,0 +1,305 @@
+#!/bin/bash
+#
+# $Header: /away/cfengine/product_rrz/rrz-master.ccstar.lanl.gov/var/lib/perceus/vnfs/common/rootfs/etc/rc.d/init.d/RCS/autobmc,v 1.3 2013/10/23 20:07:53 dwg Exp $
+#
+# autobmc
+#
+# chkconfig: 2345 99 01
+# description: automatically set BMC network characteristics
+# processname: none
+
+# Source the library functions
+. /etc/rc.d/init.d/functions
+
+prog=autobmc
+IF=eth0
+CHANNEL=1
+IPMI='/usr/bin/ipmitool'
+
+load_modules() {
+
+   if [ ! -x $IPMI ]; then
+      echo -n $"$IPMI not found!"
+      return 1
+   fi
+
+# TOSS 2.1   for module in ipmi_devintf ipmi_si ipmi_msghandler; do
+   for module in ipmi_devintf; do
+      /sbin/modprobe $module 2>/dev/null
+
+      if [ $? != 0 ]; then
+	 echo -n $"unable to load IPMI kernel modules"
+	 return 1
+      fi
+
+   done
+   return 0
+}
+
+unload_modules() {
+
+# TOSS 2.1   for module in ipmi_si ipmi_devintf ipmi_msghandler; do
+   for module in ipmi_devintf; do
+      /sbin/modprobe -r $module 2>/dev/null
+   done
+   return 0
+
+}
+
+get_eth_info() {
+
+   local my_ethBC
+
+   IP=$(/sbin/ip -o -4 addr show $IF label $IF | awk '{print $4}')
+   ethIP=$(echo $IP | /bin/sed -e 's/\/.*//')
+   if [ -z $ethIP ]; then
+      echo -n $"$IF IP not found! "
+      return 1
+   fi
+
+   my_ethBC=$(/bin/ipcalc -s -b $IP | /bin/awk -F = '{print $2}')
+   if [ -z $my_ethBC ]; then
+      echo -n $"$IF BROADCAST not found! "
+      return 1
+   fi
+
+   # GW = BROADCAST - 1
+   ethGW=$(/usr/bin/perl -MIO::Socket -e \
+      'print inet_ntoa(pack("N",(unpack("N",inet_aton($ARGV[0])))-1)) .  "\n";' $my_ethBC)
+   if [ -z $ethGW ]; then
+      echo -n $"$IF GATEWAY not found! "
+      return 1
+   fi
+
+   ethNM=$(/bin/ipcalc -s -m $IP | /bin/awk -F = '{print $2}')
+   if [ -z $ethNM ]; then
+      echo -n $"$IF NETMASK not found! "
+      return 1
+   fi
+   return 0
+
+}
+
+get_bmc_info() {
+
+   while read line; do
+
+      if [[ "$line" =~ "IP Address "[[:space:]]+ ]]; then
+	 bmcIP=$(echo "$line" | /bin/awk -F : '{print $2}')
+      fi
+
+      if [[ "$line" =~ "Subnet Mask "[[:space:]]+ ]]; then
+	 bmcNM=$(echo "$line" | /bin/awk -F : '{print $2}')
+      fi
+
+      if [[ "$line" =~ "Default Gateway IP "[[:space:]]+ ]]; then
+	 bmcGW=$(echo "$line" | /bin/awk -F : '{print $2}')
+      fi
+
+   done < <($IPMI lan print $CHANNEL)
+
+   if [ -z $bmcIP ]; then
+      echo -n $"BMC IP not found! "
+      return 1
+   fi
+
+   if [ -z $bmcNM ]; then
+      echo -n $"BMC NETMASK not found! "
+      return 1
+   fi
+
+   if [ -z $bmcGW ]; then
+      echo -n $"BMC GATEWAY not found! "
+      return 1
+   fi
+   return 0
+
+}
+
+ethIP=
+ethNM=
+ethGW=
+
+bmcIP=
+bmcNM=
+bmcGW=
+
+case "$1" in
+
+   load)
+
+      echo -n $"Loading $prog kmods: "
+      load_modules
+      if [ $? != 0 ]; then
+	 failure
+	 echo
+	 exit 1
+      else
+	 success
+	 echo
+	 exit 0
+      fi
+
+      ;;
+
+   restart|start) 
+
+      echo -n $"Starting $prog: "
+
+      load_modules
+      if [ $? != 0 ]; then
+	 failure
+	 echo
+	 exit 1
+      fi
+
+      get_eth_info
+      if [ $? != 0 ]; then
+	 failure
+	 echo
+	 exit 1
+      fi
+
+      get_bmc_info
+      if [ $? != 0 ]; then
+	 failure
+	 echo
+	 exit 1
+      fi
+
+
+      bmc_IPsrc=$($IPMI lan print $CHANNEL | grep "^IP Address Source" | awk -F ': ' '{print $2}')
+      if [ "$bmc_IPsrc" != "Static Address" ]; then
+	 echo
+	 echo $"Setting IP Address Source to Static"
+	 $IPMI lan set $CHANNEL ipsrc static
+	 if [ $? != 0 ]; then
+	    failure
+	    echo
+	    exit 1
+	 fi
+      fi
+
+      # add 10 to 3rd tuple of $IF's address
+      _bmcIP=$(/usr/bin/perl -MIO::Socket -e \
+	 'print inet_ntoa(pack("N",(unpack("N",inet_aton($ARGV[0])))+256*10)) . "\n";' $ethIP)
+
+      # add 10 to 3rd tuple of $IF's gateway
+      _bmcGW=$(/usr/bin/perl -MIO::Socket -e \
+	 'print inet_ntoa(pack("N",(unpack("N",inet_aton($ARGV[0])))+256*10)) . "\n";' $ethGW)
+
+      if [ $bmcIP != $_bmcIP ]; then
+	 echo
+	 $IPMI lan set $CHANNEL ipaddr $_bmcIP
+	 if [ $? != 0 ]; then
+	    failure
+	    echo
+	    exit 1
+	 fi
+      fi
+
+      if [ $bmcNM != $ethNM ]; then
+	 echo
+	 $IPMI lan set $CHANNEL netmask $ethNM
+	 if [ $? != 0 ]; then
+	    failure
+	    echo
+	    exit 1
+	 fi
+      fi
+
+      if [ $bmcGW != $_bmcGW ]; then
+	 echo
+	 $IPMI lan set $CHANNEL defgw ipaddr $_bmcGW
+	 if [ $? != 0 ]; then
+	    failure
+	    echo
+	    exit 1
+	 fi
+      fi
+
+      bmc_DATE=$($IPMI sel time get)
+      _bmc_DATE=$(echo $bmc_DATE | /bin/sed -e 's/:..$//')	# chop seconds
+      host_DATE=$(/bin/date +'%m/%d/%Y %H:%M:%S')
+      _host_DATE=$(echo $host_DATE | /bin/sed -e 's/:..$//')	# chop seconds
+      if [ "$_bmc_DATE" != "$_host_DATE" ]; then
+	 echo
+	 echo -n $"Setting SEL date to "
+	 $IPMI sel time set "$host_DATE"
+	 if [ $? != 0 ]; then
+	    failure
+	    echo
+	    exit 1
+	 fi
+      fi
+
+      unload_modules
+
+      success
+      echo
+      exit 0
+
+      ;;
+
+   status)
+
+      echo -n $"Status $prog: "
+
+      load_modules
+      if [ $? != 0 ]; then
+	 failure
+	 echo
+	 exit 1
+      fi
+
+      get_eth_info
+      if [ $? != 0 ]; then
+	 failure
+	 echo
+	 exit 1
+      fi
+
+      get_bmc_info
+      if [ $? != 0 ]; then
+	 failure
+	 echo
+	 exit 1
+      fi
+
+      bmc_DATE=$($IPMI sel time get)
+
+      echo
+      echo
+      echo $"Date:   $bmc_DATE"
+      echo $"$IF:			BMC:"
+      echo $"   IP: $ethIP	   IP: $bmcIP"
+      echo $"   NM: $ethNM	   NM: $bmcNM"
+      echo $"   GW: $ethGW	   GW: $bmcGW"
+      echo
+
+      unload_modules
+
+      ;;
+   stop) 
+      ;;
+
+   unload)
+
+      echo -n $"Unloading $prog kmods: "
+      unload_modules
+      if [ $? != 0 ]; then
+	 failure
+	 echo
+	 exit 1
+      else
+	 success
+	 echo
+	 exit 0
+      fi
+
+      ;;
+
+   *)
+      echo $"Usage: $prog {load|stop|start|status|restart|unload}"
+      exit 1
+esac

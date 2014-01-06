@@ -1,0 +1,125 @@
+#!/bin/sh
+#
+# $Header: /away/cfengine/product_caddy/vnfs/common/rootfs/etc/rc.d/init.d/RCS/fstab_pc,v 1.8 2012/11/29 16:07:37 ben Exp $
+#
+# fstab_pc
+#
+# chkconfig: 2345 10 90
+# description: auto-gen /etc/fstab based on Perceus variables on /proc/cmdline and /etc/sysconfig/fstab
+# processname: none
+
+# Source the library functions
+. /etc/rc.d/init.d/functions
+
+# Source the sysconfig file
+if [ -f /etc/sysconfig/fstab ]; then
+   . /etc/sysconfig/fstab
+fi
+
+prog=fstab_pc
+
+case "$1" in
+	restart|start) 
+		echo -n "Starting $prog: "
+		if [ -z $MASTERIP ]; then
+		   MASTERIP=$(sed -e '/masterip=/!d;s/.*masterip=\([^ ]\+\).*/\1/' /proc/cmdline)
+		fi
+
+		if [ -z $SWCONTAINER ]; then
+		   SWCONTAINER=$(sed -e '/swcontainer=/!d;s/.*swcontainer=\([^ ]\+\).*/\1/' /proc/cmdline)
+		fi
+
+		if [ -z $CNFS ]; then
+		   CNFS=$(sed -e '/cnfs=/!d;s/.*cnfs=\([^ ]\+\).*/\1/' /proc/cmdline)
+		fi
+
+		if [ -z $BBNFS ]; then
+		   BBNFS=$(sed -e '/bbnfs=/!d;s/.*bbnfs=\([^ ]\+\).*/\1/' /proc/cmdline)
+		fi
+
+		if (/bin/grep -q @MASTERIP@ /etc/fstab) && [ -z $MASTERIP ]; then
+		   echo -n "no masterip on /proc/cmdline or /etc/sysconfig/fstab!"
+		   failure
+		   echo
+		   exit 1
+		elif (/bin/grep -q @MASTERIP@ /etc/fstab); then
+		   /usr/bin/perl -pi -e "s/\@MASTERIP\@/$MASTERIP/g" /etc/fstab
+
+		   if [ $? != 0 ]; then
+		      echo -n "unable to substitute 's/@MASTERIP@/$MASTERIP/g' /etc/fstab!"
+		      failure
+		      echo
+		      exit 1
+		   fi
+		fi
+
+		if (/bin/grep -q @SWCONTAINER@ /etc/fstab) && [ -z $SWCONTAINER ]; then
+		   echo -n "no swcontainer on /proc/cmdline or /etc/sysconf/fstab!"
+		   failure
+		   echo
+		   exit 1
+		elif (/bin/grep -q @SWCONTAINER@ /etc/fstab); then
+		   /usr/bin/perl -pi -e "s/\@SWCONTAINER\@/$SWCONTAINER/g" /etc/fstab
+
+		   if [ $? != 0 ]; then
+		      echo -n "unable to substitute 's/@SWCONTAINER@/$SWCONTAINER/g' /etc/fstab!"
+		      failure
+		      echo
+		      exit 1
+		   fi
+		fi
+
+		if (/bin/grep -q @CNFS@ /etc/fstab) && [ -z $CNFS ]; then
+		   echo -n "no cnfs on /proc/cmdline or /etc/sysconfig/fstab!"
+		   failure
+		   echo
+		   exit 1
+		elif (/bin/grep -q @CNFS@ /etc/fstab); then
+		   # CNFS is an array
+		   # /bin/hostname -s | /bin/sed 's/[a-zA-Z-]//g' gets us a number from the hostname
+		   # we then mod it by the length of the array: % ${#CNFS[@]}
+		   # and now the result of all of that gives us the array index: ${CNFS[<result>]}
+		   MY_CNFS=${CNFS[$((`/bin/hostname -s | /bin/sed 's/[a-zA-Z-]//g' | /bin/sed 's/^0*//'`%${#CNFS[@]}))]}
+		   /usr/bin/perl -pi -e "s/\@CNFS\@/$MY_CNFS/g" /etc/fstab
+
+		   if [ $? != 0 ]; then
+		      echo -n "unable to substitute 's/@CNFS@/$MY_CNFS/g' /etc/fstab!"
+		      failure
+		      echo
+		      exit 1
+		   fi
+		fi
+
+		if (/bin/grep -q @BBNFS@ /etc/fstab) && [ -z $BBNFS ]; then
+		   echo -n "no bbnfs on /proc/cmdline or /etc/sysconfig/fstab!"
+		   failure
+		   echo
+		   exit 1
+		elif (/bin/grep -q @BBNFS@ /etc/fstab); then
+		   # BBNFS is an array
+		   # /bin/hostname -s | /bin/sed 's/[a-zA-Z-]//g' gets us a number from the hostname
+		   # we then mod it by the length of the array: % ${#BBNFS[@]}
+		   # and now the result of all of that gives us the array index: ${BBNFS[<result>]}
+		   MY_BBNFS=${BBNFS[$((`/bin/hostname -s | /bin/sed 's/[a-zA-Z-]//g' | /bin/sed 's/^0*//'`%${#CNFS[@]}))]}
+		   /usr/bin/perl -pi -e "s/\@BBNFS\@/$MY_BBNFS/g" /etc/fstab
+
+		   if [ $? != 0 ]; then
+		      echo -n "unable to substitute 's/@BBNFS@/$MY_BBNFS/g' /etc/fstab!"
+		      failure
+		      echo
+		      exit 1
+		   fi
+		fi
+
+		success
+		echo
+		exit 0
+		;;
+
+	stop) 
+		;;
+
+	*)
+		echo "Usage: $prog {stop|start|restart}"
+		exit 1
+esac

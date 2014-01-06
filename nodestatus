@@ -1,0 +1,175 @@
+#!/bin/bash
+# vi:set sw=3 tw=0: 
+#
+# Init file for node health check
+#
+# chkconfig: 345 85 15
+# description: node health check
+
+# source function library
+. /etc/rc.d/init.d/functions
+
+my_STATEFILE="/.nodestatus.$$"
+STATEFILE='/.nodestatus'
+RETVAL=0
+
+prog=nodestatus
+
+handle() {
+   /bin/rm -f $my_STATEFILE
+   exit 0
+}
+
+trap handle 1 2 3 15 20
+
+do_nodediag_check() {
+   echo -n $"   NodeDiag:	"
+
+   [ -x '/usr/bin/nodediag' ] || {
+      echo $"NodeDiag: /usr/bin/nodediag: file not found!" >> $my_STATEFILE
+      echo -n $"/usr/bin/nodediag: file not found! "
+      failure
+      echo
+      RETVAL=1
+      return 0
+   }
+
+   str=$(/usr/bin/nodediag -pvx)
+   if [ $? -ne 0 ]; then
+      failure
+      echo
+      echo "$str" | while read line; do
+	 echo "$line" | /bin/grep -Eq ^not[[:space:]]+ok && {
+	    err=$(echo "$line" | /bin/sed -re 's/^not[[:space:]]+ok[[:space:]]+[[:digit:]]+[[:space:]]+-[[:space:]]+//')
+	    echo $"nodediag $err" >> $my_STATEFILE
+	 }
+	 echo "$line" | /bin/grep -iq ^Checking && {
+	    err=$(echo "$line" | /bin/sed -e 's/       \[/[/')
+	    echo $"      $err"
+	 }
+      done
+      RETVAL=1
+   else
+      passed
+      echo
+      echo "$str" | while read line; do
+	 echo "$line" | /bin/grep -iq ^Checking && {
+	    err=$(echo "$line" | /bin/sed -e 's/       \[/[/')
+	    echo $"      $err"
+	 }
+      done
+   fi
+}
+
+do_clocksource_check() {
+   echo -n $"   Clock:	"
+   local SOURCE="hpet"
+   local my_SOURCE=$(/bin/cat /sys/devices/system/clocksource/clocksource0/current_clocksource)
+   if [ "$my_SOURCE" != "$SOURCE" ]; then
+      echo $"Clock: $my_SOURCE != $SOURCE" >> $my_STATEFILE
+      echo -n $"$my_SOURCE != $SOURCE "
+      failure
+      echo
+      RETVAL=1
+   else
+      passed
+      echo
+   fi
+}
+
+do_devshm_check() {
+   echo -n $"   DevShm:	"
+
+   /bin/grep -qE '[[:space:]]+/dev/shm[[:space:]]+' /proc/self/mountinfo >/dev/null 2>&1
+   if [ $? -eq 0 ]; then
+      success
+      echo
+      return 0
+   fi
+
+   local HAVE_FSTAB=0
+   /bin/grep -v '^#' /etc/fstab 2>&1 | /bin/awk '{print $2}' | /bin/grep -q '^/dev/shm$'
+   if [ $? -eq 0 ]; then
+      HAVE_FSTAB=1
+   fi
+
+   local HAVE_MTAB=''
+   /bin/grep -qE '[[:space:]]+/dev/shm[[:space:]]+' /etc/mtab >/dev/null 2>&1
+   if [ $? -eq 0 ]; then
+      HAVE_MTAB='-n'
+   fi
+
+   if [ $HAVE_FSTAB ]; then
+      err=$(/bin/mount $HAVE_MTAB /dev/shm)
+      if [ $? -eq 0 ]; then
+	 passed
+	 echo
+      else
+	 echo $"/dev/shm: $err!" >> $my_STATEFILE
+	 echo -n $"$err "
+	 failure
+	 echo
+	 RETVAL=1
+      fi
+   else
+      err=$(/bin/mount -t tmpfs -o defaults,mode=1777 tmpfs /dev/shm)
+      if [ $? -eq 0 ]; then
+	 passed
+	 echo
+      else
+	 echo $"/dev/shm: $err" >> $my_STATEFILE
+	 echo -n $"$err "
+	 failure
+	 echo
+	 RETVAL=1
+      fi
+   fi
+}
+
+start() {
+   echo $"Starting $prog:"
+
+   /bin/rm -f $my_STATEFILE
+
+   do_devshm_check
+   do_nodediag_check
+
+   if [ "$RETVAL" = 0 ]; then
+      echo 'READY' > $STATEFILE
+   else
+      if [ -s "$my_STATEFILE" ]; then
+	 /bin/mv -f $my_STATEFILE $STATEFILE
+      else
+	 echo "nodediag test escape!" > $STATEFILE
+      fi
+      /usr/bin/logger -p daemon.err -t nodestatus -f $STATEFILE
+   fi
+}
+
+stop() { return 0; }
+
+case "$1" in
+   start)
+      start
+      ;;
+   stop)
+      stop
+      ;;
+   restart)
+      stop
+      start
+      ;;
+   status)
+      if [ ! -e $STATEFILE ]; then	# do NOT call start here!
+	 echo UNKNOWN
+	 RETVAL=1
+      else 
+	 /bin/grep -Esv \(^READY\|^[[:space:]]*$\) $STATEFILE && RETVAL=1 || echo READY
+      fi
+      ;;
+   *)
+      echo $"Usage: $0 {start|stop|restart|status}"
+      RETVAL=1
+esac
+
+exit $RETVAL

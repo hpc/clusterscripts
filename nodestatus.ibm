@@ -1,0 +1,266 @@
+#!/bin/bash
+# vi:set sw=3 tw=0: 
+#
+# Init file for node health check
+#
+# chkconfig: 345 85 15
+# description: node health check
+
+# source function library
+. /etc/rc.d/init.d/functions
+
+my_STATEFILE="/.nodestatus.$$"
+STATEFILE='/.nodestatus'
+RETVAL=0
+
+prog=nodestatus
+
+handle() {
+   /bin/rm -f $my_STATEFILE
+   exit 0
+}
+
+trap handle 1 2 3 15 20
+
+do_nodediag_check() {
+   echo -n $"   NodeDiag:	"
+
+   [ -x '/usr/bin/nodediag' ] || {
+      echo $"NodeDiag: /usr/bin/nodediag: file not found!" >> $my_STATEFILE
+      echo -n $"/usr/bin/nodediag: file not found! "
+      failure
+      echo
+      RETVAL=1
+      return 0
+   }
+
+   str=$(/usr/bin/nodediag -pvx)
+   if [ $? -ne 0 ]; then
+      failure
+      echo
+      echo "$str" | while read line; do
+	 echo "$line" | /bin/grep -Eq ^not[[:space:]]+ok && {
+	    err=$(echo "$line" | /bin/sed -re 's/^not[[:space:]]+ok[[:space:]]+[[:digit:]]+[[:space:]]+-[[:space:]]+//')
+	    echo $"nodediag $err" >> $my_STATEFILE
+	 }
+	 echo "$line" | /bin/grep -iq ^Checking && {
+	    err=$(echo "$line" | /bin/sed -e 's/       \[/[/')
+	    echo $"      $err"
+	 }
+      done
+      RETVAL=1
+   else
+      passed
+      echo
+      echo "$str" | while read line; do
+	 echo "$line" | /bin/grep -iq ^Checking && {
+	    err=$(echo "$line" | /bin/sed -e 's/       \[/[/')
+	    echo $"      $err"
+	 }
+      done
+   fi
+}
+
+do_clocksource_check() {
+   echo -n $"   Clock:	"
+   local SOURCE="hpet"
+   local my_SOURCE=$(/bin/cat /sys/devices/system/clocksource/clocksource0/current_clocksource)
+   if [ "$my_SOURCE" != "$SOURCE" ]; then
+      echo $"Clock: $my_SOURCE != $SOURCE" >> $my_STATEFILE
+      echo -n $"$my_SOURCE != $SOURCE "
+      failure
+      echo
+      RETVAL=1
+   else
+      passed
+      echo
+   fi
+}
+
+do_devshm_check() {
+   echo -n $"   DevShm:	"
+
+   /bin/grep -qE '[[:space:]]+/dev/shm[[:space:]]+' /proc/self/mountinfo >/dev/null 2>&1
+   if [ $? -eq 0 ]; then
+      success
+      echo
+      return 0
+   fi
+
+   local HAVE_FSTAB=0
+   /bin/grep -v '^#' /etc/fstab 2>&1 | /bin/awk '{print $2}' | /bin/grep -q '^/dev/shm$'
+   if [ $? -eq 0 ]; then
+      HAVE_FSTAB=1
+   fi
+
+   local HAVE_MTAB=''
+   /bin/grep -qE '[[:space:]]+/dev/shm[[:space:]]+' /etc/mtab >/dev/null 2>&1
+   if [ $? -eq 0 ]; then
+      HAVE_MTAB='-n'
+   fi
+
+   if [ $HAVE_FSTAB ]; then
+      err=$(/bin/mount $HAVE_MTAB /dev/shm)
+      if [ $? -eq 0 ]; then
+	 passed
+	 echo
+      else
+	 echo $"/dev/shm: $err!" >> $my_STATEFILE
+	 echo -n $"$err "
+	 failure
+	 echo
+	 RETVAL=1
+      fi
+   else
+      err=$(/bin/mount -t tmpfs -o defaults,mode=1777 tmpfs /dev/shm)
+      if [ $? -eq 0 ]; then
+	 passed
+	 echo
+      else
+	 echo $"/dev/shm: $err" >> $my_STATEFILE
+	 echo -n $"$err "
+	 failure
+	 echo
+	 RETVAL=1
+      fi
+   fi
+}
+
+function _idx() {
+   eval 'case $1 in '${cases[*]}' *) [ "$1" ] && { cases=( ${cases[*]} '\''"'\''$1'\''") echo '${#cases[*]}';;'\'' ); echo '${#cases[*]}';}; esac'	#';
+}
+
+function do_cmos_check() {
+   local RC=0
+   local STATUS=
+   local -a array
+
+   echo -n $"   CMOS:	"
+
+   _idx CMOS_NumLock >/dev/null;			array[`_idx CMOS_NumLock`]="Off"
+   _idx CMOS_AlternateBootDevice4 >/dev/null;		array[`_idx CMOS_AlternateBootDevice4`]="Hard Disk 0"
+   _idx CMOS_AlternateBootDevice3 >/dev/null;		array[`_idx CMOS_AlternateBootDevice3`]="CD ROM"
+   _idx CMOS_AlternateBootDevice2 >/dev/null;		array[`_idx CMOS_AlternateBootDevice2`]="Diskette Drive 0"
+   _idx CMOS_AlternateBootDevice1 >/dev/null;		array[`_idx CMOS_AlternateBootDevice1`]="Network"
+   _idx CMOS_PS2Mouse >/dev/null;			array[`_idx CMOS_PS2Mouse`]="Not Installed"
+   _idx CMOS_PrimaryBootDevice4 >/dev/null;		array[`_idx CMOS_PrimaryBootDevice4`]="Hard Disk 0"
+   _idx CMOS_PrimaryBootDevice3 >/dev/null;		array[`_idx CMOS_PrimaryBootDevice3`]="Network"
+   _idx CMOS_PrimaryBootDevice2 >/dev/null;		array[`_idx CMOS_PrimaryBootDevice2`]="Diskette Drive 0"
+   _idx CMOS_PrimaryBootDevice1 >/dev/null;		array[`_idx CMOS_PrimaryBootDevice1`]="CD ROM"
+   _idx CMOS_IOMMU_PLANAR_ENABLE >/dev/null;		array[`_idx CMOS_IOMMU_PLANAR_ENABLE`]="Enabled"
+   _idx CMOS_PostBootFailRequired >/dev/null;		array[`_idx CMOS_PostBootFailRequired`]="Disabled"
+   _idx CMOS_StopOnError >/dev/null;			array[`_idx CMOS_StopOnError`]="Enabled"
+   _idx CMOS_NV_ChipKill >/dev/null;			array[`_idx CMOS_NV_ChipKill`]="Enabled"
+   _idx CMOS_INT_19H >/dev/null;			array[`_idx CMOS_INT_19H`]="Disabled"
+   _idx CMOS_BMCSerialConfig >/dev/null;		array[`_idx CMOS_BMCSerialConfig`]="Disabled"
+   _idx CMOS_NV_CS_SpareCTL >/dev/null;			array[`_idx CMOS_NV_CS_SpareCTL`]="Disabled"
+   _idx CMOS_BMCSerialShareConfig >/dev/null;		array[`_idx CMOS_BMCSerialShareConfig`]="Disabled"
+   _idx CMOS_ENET1_PLANAR_ENABLE >/dev/null;		array[`_idx CMOS_ENET1_PLANAR_ENABLE`]="Enabled"
+   _idx CMOS_ENET2_PLANAR_ENABLE >/dev/null;		array[`_idx CMOS_ENET2_PLANAR_ENABLE`]="Enabled"
+   _idx CMOS_SCSI_PLANAR_ENABLE >/dev/null;		array[`_idx CMOS_SCSI_PLANAR_ENABLE`]="Disabled"
+   _idx CMOS_HPET_PLANAR_ENABLE >/dev/null;		array[`_idx CMOS_HPET_PLANAR_ENABLE`]="Enabled"
+   _idx CMOS_MCFG_PLANAR_ENABLE >/dev/null;		array[`_idx CMOS_MCFG_PLANAR_ENABLE`]="Enabled"
+   _idx CMOS_SerialA >/dev/null;			array[`_idx CMOS_SerialA`]="Port 3F8, IRQ 4"
+   _idx CMOS_SerialB >/dev/null;			array[`_idx CMOS_SerialB`]="Disabled"
+   _idx CMOS_ENET_PXE_ENABLE >/dev/null;		array[`_idx CMOS_ENET_PXE_ENABLE`]="Planar Ethernet 1"
+   _idx CMOS_ROMControlSlot1 >/dev/null;		array[`_idx CMOS_ROMControlSlot1`]="Disabled"
+   _idx CMOS_ROMControlSlot2 >/dev/null;		array[`_idx CMOS_ROMControlSlot2`]="Disabled"
+   _idx CMOS_ROMControlSlot3 >/dev/null;		array[`_idx CMOS_ROMControlSlot3`]="Disabled"
+   _idx CMOS_ROMControlSlot4 >/dev/null;		array[`_idx CMOS_ROMControlSlot4`]="Disabled"
+   _idx CMOS_ReportUserDisabledPCIDevices >/dev/null;	array[`_idx CMOS_ReportUserDisabledPCIDevices`]="Enabled"
+   _idx CMOS_PCIBootPriority >/dev/null;		array[`_idx CMOS_PCIBootPriority`]="Planar SAS"
+   _idx CMOS_UsbDisk >/dev/null;			array[`_idx CMOS_UsbDisk`]="Enabled"
+   _idx CMOS_WakeOnLAN >/dev/null;			array[`_idx CMOS_WakeOnLAN`]="Disabled"
+   _idx CMOS_RemoteConsoleEnable >/dev/null;		array[`_idx CMOS_RemoteConsoleEnable`]="Enabled"
+   _idx CMOS_RemoteConsoleComPort >/dev/null;		array[`_idx CMOS_RemoteConsoleComPort`]="COM 1"
+   _idx CMOS_RemoteConsoleBaud >/dev/null;		array[`_idx CMOS_RemoteConsoleBaud`]="57600"
+   _idx CMOS_RemoteConsoleDataBits >/dev/null;		array[`_idx CMOS_RemoteConsoleDataBits`]="8"
+   _idx CMOS_RemoteConsoleParity >/dev/null;		array[`_idx CMOS_RemoteConsoleParity`]="None"
+   _idx CMOS_RemoteConsoleStopBits >/dev/null;		array[`_idx CMOS_RemoteConsoleStopBits`]="1"
+   _idx CMOS_RemoteConsoleEmulation >/dev/null;		array[`_idx CMOS_RemoteConsoleEmulation`]="VT100/VT220"
+   _idx CMOS_RemoteConsoleKybdEmul >/dev/null;		array[`_idx CMOS_RemoteConsoleKybdEmul`]="VT100/VT220"
+   _idx CMOS_RemoteConsoleBootEnable >/dev/null;	array[`_idx CMOS_RemoteConsoleBootEnable`]="Enabled"
+   _idx CMOS_RemoteConsoleFlowCtrl >/dev/null;		array[`_idx CMOS_RemoteConsoleFlowCtrl`]="Hardware"
+
+   STATUS=$(
+      cd /tmp
+      /bin/rm -f /tmp/asu.log
+      CMOS=$(/opt/ibm/toolscenter/asu/asu64 show all 2>/dev/null | /bin/grep ^CMOS)
+      if [ $? != 0 ]; then
+         echo "CORRUPT"
+         exit 1
+      fi
+
+      /bin/rm -f /tmp/asu.log
+
+      echo "$CMOS" | while read line; do
+	 KEY=$(echo "$line" | /bin/awk -F= '{print $1}')
+	 VALUE=$(echo "$line" | /bin/awk -F= '{print $2}')
+	 if [ "${array[`_idx $KEY`]}" != "$VALUE" ]; then
+	    echo $"$KEY NOT '${array[`_idx $KEY`]}' "
+	    exit 1
+	 fi
+      done
+   )
+   RC=$?
+
+   if [ $RC -ne 0 ]; then
+      echo $"CMOS: $STATUS" >> $my_STATEFILE
+      echo -n $"$STATUS "
+      failure
+      echo
+      RETVAL=1
+   else
+      passed
+      echo
+   fi
+}
+
+start() {
+   echo $"Starting $prog:"
+
+   /bin/rm -f $my_STATEFILE
+
+   do_cmos_check
+   do_devshm_check
+   do_nodediag_check
+
+   if [ "$RETVAL" = 0 ]; then
+      echo 'READY' > $STATEFILE
+   else
+      if [ -s "$my_STATEFILE" ]; then
+	 /bin/mv -f $my_STATEFILE $STATEFILE
+      else
+	 echo "nodediag test escape!" > $STATEFILE
+      fi
+      /usr/bin/logger -p daemon.err -t nodestatus -f $STATEFILE
+   fi
+}
+
+stop() { return 0; }
+
+case "$1" in
+   start)
+      start
+      ;;
+   stop)
+      stop
+      ;;
+   restart)
+      stop
+      start
+      ;;
+   status)
+      if [ ! -e $STATEFILE ]; then	# do NOT call start here!
+	 echo UNKNOWN
+	 RETVAL=1
+      else 
+	 /bin/grep -Esv \(^READY\|^[[:space:]]*$\) $STATEFILE && RETVAL=1 || echo READY
+      fi
+      ;;
+   *)
+      echo $"Usage: $0 {start|stop|restart|status}"
+      RETVAL=1
+esac
+
+exit $RETVAL

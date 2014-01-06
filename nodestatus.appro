@@ -1,0 +1,313 @@
+#!/bin/bash
+# vi:set sw=3 tw=0: 
+#
+# Init file for node health check
+#
+# chkconfig: 345 85 15
+# description: node health check
+
+# source function library
+. /etc/rc.d/init.d/functions
+
+my_STATEFILE="/.nodestatus.$$"
+STATEFILE='/.nodestatus'
+RETVAL=0
+
+prog=nodestatus
+
+handle() {
+   /bin/rm -f $my_STATEFILE
+   exit 0
+}
+
+trap handle 1 2 3 15 20
+
+do_nodediag_check() {
+   echo -n $"   NodeDiag:	"
+
+   [ -x '/usr/bin/nodediag' ] || {
+      echo $"NodeDiag: /usr/bin/nodediag: file not found!" >> $my_STATEFILE
+      echo -n $"/usr/bin/nodediag: file not found! "
+      failure
+      echo
+      RETVAL=1
+      return 0
+   }
+
+   str=$(/usr/bin/nodediag -pvx)
+   if [ $? -ne 0 ]; then
+      failure
+      echo
+      echo "$str" | while read line; do
+	 echo "$line" | /bin/grep -Eq ^not[[:space:]]+ok && {
+	    err=$(echo "$line" | /bin/sed -re 's/^not[[:space:]]+ok[[:space:]]+[[:digit:]]+[[:space:]]+-[[:space:]]+//')
+	    echo $"nodediag $err" >> $my_STATEFILE
+	 }
+	 echo "$line" | /bin/grep -iq ^Checking && {
+	    err=$(echo "$line" | /bin/sed -e 's/       \[/[/')
+	    echo $"      $err"
+	 }
+      done
+      RETVAL=1
+   else
+      passed
+      echo
+      echo "$str" | while read line; do
+	 echo "$line" | /bin/grep -iq ^Checking && {
+	    err=$(echo "$line" | /bin/sed -e 's/       \[/[/')
+	    echo $"      $err"
+	 }
+      done
+   fi
+}
+
+do_clocksource_check() {
+   echo -n $"   Clock:	"
+   local SOURCE="hpet"
+   local my_SOURCE=$(/bin/cat /sys/devices/system/clocksource/clocksource0/current_clocksource)
+   if [ "$my_SOURCE" != "$SOURCE" ]; then
+      echo $"Clock: $my_SOURCE != $SOURCE" >> $my_STATEFILE
+      echo -n $"$my_SOURCE != $SOURCE "
+      failure
+      echo
+      RETVAL=1
+   else
+      passed
+      echo
+   fi
+}
+
+do_devshm_check() {
+   echo -n $"   DevShm:	"
+
+   /bin/grep -qE '[[:space:]]+/dev/shm[[:space:]]+' /proc/self/mountinfo >/dev/null 2>&1
+   if [ $? -eq 0 ]; then
+      success
+      echo
+      return 0
+   fi
+
+   local HAVE_FSTAB=0
+   /bin/grep -v '^#' /etc/fstab 2>&1 | /bin/awk '{print $2}' | /bin/grep -q '^/dev/shm$'
+   if [ $? -eq 0 ]; then
+      HAVE_FSTAB=1
+   fi
+
+   local HAVE_MTAB=''
+   /bin/grep -qE '[[:space:]]+/dev/shm[[:space:]]+' /etc/mtab >/dev/null 2>&1
+   if [ $? -eq 0 ]; then
+      HAVE_MTAB='-n'
+   fi
+
+   if [ $HAVE_FSTAB ]; then
+      err=$(/bin/mount $HAVE_MTAB /dev/shm)
+      if [ $? -eq 0 ]; then
+	 passed
+	 echo
+      else
+	 echo $"/dev/shm: $err!" >> $my_STATEFILE
+	 echo -n $"$err "
+	 failure
+	 echo
+	 RETVAL=1
+      fi
+   else
+      err=$(/bin/mount -t tmpfs -o defaults,mode=1777 tmpfs /dev/shm)
+      if [ $? -eq 0 ]; then
+	 passed
+	 echo
+      else
+	 echo $"/dev/shm: $err" >> $my_STATEFILE
+	 echo -n $"$err "
+	 failure
+	 echo
+	 RETVAL=1
+      fi
+   fi
+}
+
+function _idx() {
+   eval 'case $1 in '${cases[*]}' *) [ "$1" ] && { cases=( ${cases[*]} '\''"'\''$1'\''") echo '${#cases[*]}';;'\'' ); echo '${#cases[*]}';}; esac'	#';
+}
+
+function do_cmos_check() {
+   local RC=0
+   local STATUS=
+   local -a array
+
+   echo -n $"   CMOS:	"
+
+   _idx BIOSVersion >/dev/null;				array[`_idx BIOSVersion`]='SE5C600.86B.01.02.0003.022820121335'
+   _idx Assert_NMI_on_SERR >/dev/null;			array[`_idx Assert_NMI_on_SERR`]='1'
+   _idx Assert_NMI_on_PERR >/dev/null;			array[`_idx Assert_NMI_on_PERR`]='1'
+   _idx Reset_on_CATERR >/dev/null;			array[`_idx Reset_on_CATERR`]='1'
+   _idx Reset_on_ERR2 >/dev/null;			array[`_idx Reset_on_ERR2`]='1'
+   _idx Resume_on_AC_Power_Loss >/dev/null;		array[`_idx Resume_on_AC_Power_Loss`]='0'
+   _idx Clear_System_Event_Log >/dev/null;		array[`_idx Clear_System_Event_Log`]='0'
+   _idx FRB-2_Enable >/dev/null;			array[`_idx FRB-2_Enable`]='1'
+   _idx OS_Boot_Watchdog_Timer >/dev/null;		array[`_idx OS_Boot_Watchdog_Timer`]='0'
+   _idx Plug_N_Play_BMC_Detection >/dev/null;		array[`_idx Plug_N_Play_BMC_Detection`]='0'
+   _idx Shutdown_Policy >/dev/null;			array[`_idx Shutdown_Policy`]='0'
+   _idx Console_Redirection >/dev/null;			array[`_idx Console_Redirection`]='1'
+   _idx Flow_Control >/dev/null;			array[`_idx Flow_Control`]='0'
+   _idx Baud_Rate >/dev/null;				array[`_idx Baud_Rate`]='7'
+   _idx Terminal_Type >/dev/null;			array[`_idx Terminal_Type`]='0'
+   _idx Legacy_OS_Redirection >/dev/null;		array[`_idx Legacy_OS_Redirection`]='1'
+   _idx Terminal_Resolution >/dev/null;			array[`_idx Terminal_Resolution`]='0'
+   _idx Quiet_Boot >/dev/null;				array[`_idx Quiet_Boot`]='0'
+   _idx POST_Error_Pause >/dev/null;			array[`_idx POST_Error_Pause`]='0'
+   _idx Intel_QPI_Frequency_Select >/dev/null;		array[`_idx Intel_QPI_Frequency_Select`]='255'
+   _idx Intel_Turbo_Boost_Technology >/dev/null;	array[`_idx Intel_Turbo_Boost_Technology`]='1'
+   _idx Enhanced_Intel_SpeedStep_Tech >/dev/null;	array[`_idx Enhanced_Intel_SpeedStep_Tech`]='1'
+   _idx Processor_C3 >/dev/null;			array[`_idx Processor_C3`]='0'
+   _idx Processor_C6 >/dev/null;			array[`_idx Processor_C6`]='0'
+   _idx Intel_Hyper-Threading_Tech >/dev/null;		array[`_idx Intel_Hyper-Threading_Tech`]='0'
+   _idx Active_Processor_Cores >/dev/null;		array[`_idx Active_Processor_Cores`]='0'
+   _idx Execute_Disable_Bit >/dev/null;			array[`_idx Execute_Disable_Bit`]='1'
+   _idx Intel_Virtualization_Technology >/dev/null;	array[`_idx Intel_Virtualization_Technology`]='0'
+   _idx Intel_VT_for_Directed_I/O >/dev/null;		array[`_idx Intel_VT_for_Directed_I/O`]='0'
+   _idx Enhanced_Error_Containment_Mode >/dev/null;	array[`_idx Enhanced_Error_Containment_Mode`]='0'
+   _idx MLC_Streamer >/dev/null;			array[`_idx MLC_Streamer`]='0'
+   _idx MLC_Spatial_Prefetcher >/dev/null;		array[`_idx MLC_Spatial_Prefetcher`]='0'
+   _idx DCU_Data_Prefetcher >/dev/null;			array[`_idx DCU_Data_Prefetcher`]='0'
+   _idx DCU_Instruction_Prefetcher >/dev/null;		array[`_idx DCU_Instruction_Prefetcher`]='0'
+   _idx Direct_Cache_Access >/dev/null;			array[`_idx Direct_Cache_Access`]='1'
+   _idx SMM_Wait_Timeout >/dev/null;			array[`_idx SMM_Wait_Timeout`]='20'
+   _idx CPU_Power_and_Performance_Policy >/dev/null;	array[`_idx CPU_Power_and_Performance_Policy`]='1'
+   _idx Memory_Operating_Speed_Selection >/dev/null;	array[`_idx Memory_Operating_Speed_Selection`]='0'
+   _idx Patrol_Scrub >/dev/null;			array[`_idx Patrol_Scrub`]='1'
+   _idx Demand_Scrub >/dev/null;			array[`_idx Demand_Scrub`]='1'
+   _idx Correctable_Error_Threshold >/dev/null;		array[`_idx Correctable_Error_Threshold`]='1'
+   _idx Memory_Power_Optimization >/dev/null;		array[`_idx Memory_Power_Optimization`]='0'
+   _idx Select_Memory_RAS_Configuration >/dev/null;	array[`_idx Select_Memory_RAS_Configuration`]='0'
+   _idx NUMA_Optimized >/dev/null;			array[`_idx NUMA_Optimized`]='1'
+   _idx AHCI_Capable_SATA_Controller >/dev/null;	array[`_idx AHCI_Capable_SATA_Controller`]='2'
+   _idx SAS/SATA_Capable_Controller >/dev/null;		array[`_idx SAS/SATA_Capable_Controller`]='4'
+   _idx Maximize_Memory_below_4GB >/dev/null;		array[`_idx Maximize_Memory_below_4GB`]='0'
+   _idx Memory_Mapped_I/O_above_4GB >/dev/null;		array[`_idx Memory_Mapped_I/O_above_4GB`]='0'
+   _idx Wake_on_LAN >/dev/null;				array[`_idx Wake_on_LAN`]='1'
+   _idx PXE_1GbE_Option_ROM >/dev/null;			array[`_idx PXE_1GbE_Option_ROM`]='1'
+   _idx Onboard_NIC1_Control >/dev/null;		array[`_idx Onboard_NIC1_Control`]='1'
+   _idx Onboard_NIC1_Port1 >/dev/null;			array[`_idx Onboard_NIC1_Port1`]='1'
+   _idx Onboard_NIC1_Port2 >/dev/null;			array[`_idx Onboard_NIC1_Port2`]='1'
+   _idx Onboard_NIC1_Port1_PXE >/dev/null;		array[`_idx Onboard_NIC1_Port1_PXE`]='1'
+   _idx Onboard_NIC1_Port2_PXE >/dev/null;		array[`_idx Onboard_NIC1_Port2_PXE`]='1'
+   _idx Serial_A_Enable >/dev/null;			array[`_idx Serial_A_Enable`]='1'
+   _idx Address >/dev/null;				array[`_idx Address`]='1'
+   _idx IRQ >/dev/null;					array[`_idx IRQ`]='0'
+   _idx USB_Controller >/dev/null;			array[`_idx USB_Controller`]='1'
+   _idx Legacy_USB_Support >/dev/null;			array[`_idx Legacy_USB_Support`]='0'
+   _idx Port_60/64_Emulation >/dev/null;		array[`_idx Port_60/64_Emulation`]='1'
+   _idx Make_USB_Devices_Non-Bootable >/dev/null;	array[`_idx Make_USB_Devices_Non-Bootable`]='0'
+   _idx Device_Reset_timeout >/dev/null;		array[`_idx Device_Reset_timeout`]='1'
+   _idx Set_Throttling_Mode >/dev/null;			array[`_idx Set_Throttling_Mode`]='0'
+   _idx Altitude >/dev/null;				array[`_idx Altitude`]='3000'
+   _idx Set_Fan_Profile >/dev/null;			array[`_idx Set_Fan_Profile`]='1'
+   _idx Fan_PWM_Offset >/dev/null;			array[`_idx Fan_PWM_Offset`]='0'
+   _idx Quiet_Fan_Idle_Mode >/dev/null;			array[`_idx Quiet_Fan_Idle_Mode`]='0'
+   _idx Out-of-Band_Mgmt_Port >/dev/null;		array[`_idx Out-of-Band_Mgmt_Port`]='1'
+   _idx Fast_Boot >/dev/null;				array[`_idx Fast_Boot`]='0'
+   _idx System_Boot_Timeout >/dev/null;			array[`_idx System_Boot_Timeout`]='0'
+   _idx Bootup_NumLock_State >/dev/null;		array[`_idx Bootup_NumLock_State`]='1'
+   _idx EFI_Optimized_Boot >/dev/null;			array[`_idx EFI_Optimized_Boot`]='0'
+   _idx Boot_Option_Retry >/dev/null;			array[`_idx Boot_Option_Retry`]='1'
+   _idx USB_Boot_Priority >/dev/null;			array[`_idx USB_Boot_Priority`]='1'
+   _idx Static_Boot_Order >/dev/null;			array[`_idx Static_Boot_Order`]='0'
+   _idx Option_ROM_Messages >/dev/null;			array[`_idx Option_ROM_Messages`]='1'
+   _idx Interrupt_19_Capture >/dev/null;		array[`_idx Interrupt_19_Capture`]='1'
+   _idx Front_Panel_Lockout >/dev/null;			array[`_idx Front_Panel_Lockout`]='0'
+
+   STATUS=$(
+      cd /tmp
+      /bin/rm -f /tmp/$$.INI
+      /usr/sbin/syscfg /s $$.INI /b >/dev/null 2>&1
+
+      if [ $? -ne 0 -o ! -s /tmp/$$.INI ]; then
+	 echo "CORRUPT"
+	 /bin/rm -f /tmp/$$.INI
+	 exit 1
+      fi
+
+      CMOS=$(/bin/grep ';' /tmp/$$.INI \
+	 | /bin/grep -v '^FWBootVersion' \
+	 | /bin/grep -v '^FWOpcodeVersion' \
+	 | /bin/grep -v '^PIAVersion' \
+	 | /bin/grep -v '^;.*$' \
+	 | /bin/sed -re 's/[[:space:]]*;.*$//' \
+	 | /bin/sed -re 's/[[:space:]]?\(\w+\)//' \
+	 | /usr/bin/tr '&' N \
+	 | /usr/bin/tr ' ' _)
+
+      /bin/rm -f /tmp/$$.INI
+
+      echo "$CMOS" | while read line; do
+	 KEY=$(echo "$line" | /bin/awk -F= '{print $1}')
+	 VALUE=$(echo "$line" | /bin/awk -F= '{print $2}')
+	 if [ "${array[`_idx $KEY`]}" != "$VALUE" ]; then
+	    echo $"$KEY NOT '${array[`_idx $KEY`]}' "
+	    exit 1
+	 fi
+      done
+   )
+   RC=$?
+
+   if [ $RC -ne 0 ]; then
+      echo $"CMOS: $STATUS" >> $my_STATEFILE
+      echo -n $"$STATUS "
+      failure
+      echo
+      RETVAL=1
+   else
+      passed
+      echo
+   fi
+}
+
+start() {
+   echo $"Starting $prog:"
+
+   /bin/rm -f $my_STATEFILE
+
+   do_cmos_check
+   do_devshm_check
+   do_nodediag_check
+
+   if [ "$RETVAL" = 0 ]; then
+      echo 'READY' > $STATEFILE
+   else
+      if [ -s "$my_STATEFILE" ]; then
+	 /bin/mv -f $my_STATEFILE $STATEFILE
+      else
+	 echo "nodediag test escape!" > $STATEFILE
+      fi
+      /usr/bin/logger -p daemon.err -t nodestatus -f $STATEFILE
+   fi
+}
+
+stop() { return 0; }
+
+case "$1" in
+   start)
+      start
+      ;;
+   stop)
+      stop
+      ;;
+   restart)
+      stop
+      start
+      ;;
+   status)
+      if [ ! -e $STATEFILE ]; then	# do NOT call start here!
+	 echo UNKNOWN
+	 RETVAL=1
+      else 
+	 /bin/grep -Esv \(^READY\|^[[:space:]]*$\) $STATEFILE && RETVAL=1 || echo READY
+      fi
+      ;;
+   *)
+      echo $"Usage: $0 {start|stop|restart|status}"
+      RETVAL=1
+esac
+
+exit $RETVAL
