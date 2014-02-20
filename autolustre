@@ -1,0 +1,570 @@
+#!/bin/bash
+#
+# autolustre
+#
+# chkconfig: 345 60 20
+# description: Perform automatic LUSTRE server configuration
+# processname: none
+# config: /etc/sysconfig/autolustre
+# pidfile: /var/run/autolustre.pid
+
+# Source the library functions
+. /etc/rc.d/init.d/functions
+
+STATUS=0
+
+prog=autolustre
+config=/etc/sysconfig/$prog
+lockfile=/var/lock/subsys/$prog
+remotelockfile=/var/lock/subsys/$prog-ost
+pidfile=/var/run/$prog.pid
+[ -f $config ] && . $config
+
+shopt -s nocasematch
+
+block() {
+   local command="$1" strerror=
+
+   while [ 1 ]; do
+      echo $"$prog[ blocked ] exec '$command' failed!"
+      logger -p daemon.alert -t $prog[ blocked ] -- "exec '$command' failed!"
+      sleep ${TimeOut:-'60'}				# default: 60s
+      strerror=$($command 2>&1)
+      if [ $? -eq 0 ]; then
+	 echo $"$prog[unblocked] exec '$command' succeeded!"
+	 logger -p daemon.alert -t $prog[unblocked] -- "exec '$command' succeeded!"
+	 break
+      fi
+   done
+}
+
+warn() {
+   echo $"$prog[ warning ] $1"
+   logger -p daemon.err -t $prog[ warning ] -- "$1"
+}
+
+die() {
+   while [ 1 ]; do
+      echo $"$prog[  fatal  ] $1"
+      logger -p daemon.emerg -t $prog[  fatal  ] -- "$1"
+      sleep ${TimeOut:-'60'}				# default: 60s
+   done
+}
+
+
+do_exit() {
+   rm -f $pidfile
+   exit $STATUS
+}
+
+trap 'rm -f "$lockfile"; do_exit' 1 2 3 15 20
+
+do_contact_mds() {
+   local strerror=
+
+   #Check to make sure MGS is mounted
+   strerror=$(ssh -nx "$MDSServer" 'grep -q /mnt/mgs /proc/mounts' 2>&1)
+   if [ $? -ne 0 ]; then
+      warning
+      echo
+      warn "MGS not mounted, or MDS server not responding, waiting for mount..."
+      block "ssh -nx $MDSServer grep -q /mnt/mgs /proc/mounts"
+   fi
+
+   return 0
+}
+
+do_lock_mds() {
+   echo -n $"   Wait for MGS: "
+   local strerror=
+
+   #Check to make sure MGS is mounted
+   strerror=$(ssh -nx "$MDSServer" "grep -q /mnt/mgs /proc/mounts" 2>&1)
+   if [ $? -eq 0 ]; then
+      success
+      echo
+   else
+      warning
+      echo
+      warn "MGS not mounted, or MDS server not responding"
+      block "ssh -nx $MDSServer grep -q /mnt/mgs /proc/mounts"
+   fi
+
+   echo -n $"   Locking MDS node: "
+   strerror=$(ssh -nx "$MDSServer" "[ ! -f $remotelockfile ] && touch $remotelockfile" 2>&1)
+   if [ $? -eq 0 ]; then
+      success
+      echo
+   else
+      warning
+      echo
+      warn "unable to get lock [$MDSServer], another OSS might be configuring or MDS is down, retrying"
+      block "ssh -nx $MDSServer \"[ ! -f $remotelockfile ] && touch $remotelockfile\""
+   fi
+
+   return 0
+}
+
+do_unlock_mds() {
+   echo -n $"   Unlocking MDS node: "
+   local strerror=
+   strerror=$(ssh -nx "$MDSServer" "[ -f $remotelockfile ] && rm $remotelockfile" 2>&1)
+   if [ $? -eq 0 ]; then
+      success
+      echo
+   else
+      warning
+      warn "$strerror"
+      warn "unable to unlock MDS!"
+   fi
+
+   return 0
+}
+
+do_deactivate_oss() {
+   echo -n $"$1   De-activating OSSes: "
+   local strerror=
+
+   return 0
+}
+
+do_deactivate_mds() {
+   echo -n $"$1   De-activating MDS: "
+   local strerror=
+
+   return 0
+}
+
+am_i_mds() {
+   shorthostname=$(hostname -s)
+   [ "$shorthostname" = "$MDSServer" ]
+}
+
+am_i_oss() {
+   shorthostname=$(hostname -s)
+   [ "${NodeDesc[$shorthostname]}" = "oss" ]
+}
+
+do_rescan_scsi() {
+   echo $"   Re-scanning SCSI devices: "
+   local NodeName= strerror=
+
+   for NodeName in "${!NodeDesc[@]}"; do
+      echo -n $"      $NodeName: "
+      strerror=$(ssh -nx "$NodeName" '/usr/bin/scsi-rescan 2>&1' 2>&1)
+      if [ $? -ne 0 ]; then
+	 warning
+	 echo
+	 warn "$strerror"
+	 warn "unable to exec 'ssh "$NodeName" /usr/bin/scsi-rescan'!"
+      else
+	 success
+	 echo
+      fi
+   done
+
+   return 0
+}
+
+# Scan through system disks
+do_scan_disks() {
+   echo -n $"   Scanning system disks: "
+   local NodeName= disks= name= status= udevinfo=
+
+   disks=$(awk '/[[:space:]]+sd[^[:digit:]]+$/ \
+      {                                        \
+	 if (NF > 3 && $3 > 1)                 \
+	    print $4                           \
+      }' /proc/partitions 2>&1)
+
+   if [ $? -ne 0 ]; then
+      warning
+      echo
+      warn $"$disks"
+      warn 'failed to enumerate /proc/partitions!'
+      return 1
+   fi
+
+   if [ -z "$disks" ]; then
+      warning
+      echo
+      warn 'failed to locate any locally-attached disk!'
+      return 1
+   fi
+   echo
+
+   udevinfo=$(type -p udevadm)
+   if [ $? -eq 0 ]; then
+      udevinfo="$udevinfo info -q all -n"
+   else
+      udevinfo=$(type -p udevinfo)
+      [ $? -eq 0 ] && udevinfo="$udevinfo -q all -n"
+   fi
+
+   am_i_oss
+   if [ $? -eq 0 ]; then
+      do_lock_mds
+   fi
+
+   while read disk; do
+      grep -q "^/dev/$disk" '/proc/self/mounts' && continue
+      echo -n $"      /dev/$disk: "
+
+      name=
+      [ -n "$udevinfo" ] &&                 \
+	 name=$($udevinfo /dev/$disk 2>&1 | \
+	    awk -F= '/ID_SERIAL=/           \
+	       {                            \
+		  gsub(/\W+/,"_",$2);       \
+		  print $2;                 \
+		  exit                      \
+	       }'                           \
+	 )
+      [ -z "$name" ] && name="n$disk"
+
+      blkid /dev/$disk 2>&1| grep -q -e OST -e MDT -e MGS
+      if [ $? -eq 0 ]; then
+	 echo -n $'bound: '
+	 passed
+	 echo
+         do_mount_local_fs "/dev/$disk"
+	 echo
+      else
+	 echo $'free disk: '
+         do_create_and_mount_localfs "/dev/$disk"
+	 success
+	 echo
+      fi
+   done < <(echo "$disks")
+
+   am_i_oss
+   if [ $? -eq 0 ]; then
+      do_unlock_mds
+   fi
+
+   return 0
+}
+
+do_create_and_mount_localfs() {
+   echo -n $"   Creating FS's from free disks: "
+   local strerror=
+
+   am_i_mds
+   if [ $? -eq 0 ]; then
+      # If this is the MDS
+      # is there already an MGS defined
+      ls /dev/disk/by-label | grep -q MGS
+      if [ $? -eq 0 ]; then
+         # is there an MDT NOT yet defined
+         ls /dev/disk/by-label | grep -q MDT
+         if [ $? -ne 0 ]; then
+            # get the NID from the MDSServer
+            nid=$( lctl list_nids | head -1 )
+            if [ -z "$nid" ]; then
+               warning
+               echo
+               warn 'failed to list MGS NID'
+               return 1
+            fi
+            # format MDT filesystem
+            mkfs.lustre --mdt --fsname=$FSName --index=0 --mgsnid=$nid $1
+            # and mount it
+            mount -t lustre $1 /mnt/mdt
+         fi
+      else
+         # MGS isn't defined yet, format filesystem
+         mkfs.lustre --mgs $1
+         # and mount it
+         mount -t lustre $1 /mnt/mgs
+      fi
+    fi
+
+    am_i_oss
+    if [ $? -eq 0 ]; then
+       # If this is an OSS
+       # we need to get the next avaiable OST index from the MGS
+       retval=$(ssh -nx "$MDSServer" "cat /proc/fs/lustre/mgs/MGS/live/$FSName | grep OST| sort -rn | head -1| awk -F 'OST' '{print \$2}'")
+       if [ -z $retval ]; then
+          index=0
+       else
+          index=$(( 16#$retval +1 ))
+       fi
+       # also get the NID from the MDSServer
+       nid=$( ssh -nx "$MDSServer" 'lctl list_nids | head -1' )
+       # format the OST filesystem
+       mkfs.lustre --ost --fsname=$FSName --index=$index --mgsnid=$nid $1
+       # pad the index
+       index=$(printf %02d $index)
+       # and mount it
+       mount -t lustre $1 /mnt/ost$index
+   fi
+}
+
+do_mount_local_fs() {
+   echo -n $"      Mounting $1: "
+   local strerror=
+
+   blkid $1 | grep -q MGS
+   if [ $? -eq 0 ]; then
+      # Mount the MGS
+      mount -t lustre $1 /mnt/mgs
+      success
+      return 0
+   fi
+
+   blkid $1 | grep -q MDT
+   if [ $? -eq 0 ]; then
+      # Mount the MDT
+      mount -t lustre $1 /mnt/mdt
+      success
+      return 0
+   fi
+
+   # otherwise this is an OST we need to mount, make sure MGS is mounted
+   do_contact_mds
+
+   # double check that this is an OST
+   blkid $1 | grep -q OST
+   if [ $? -eq 0 ]; then
+      retval=$(blkid $1 | awk -F '"' '{print $2}' |tail -c 3)
+      mount -t lustre $1 /mnt/ost$((16#$retval))
+      success
+      return 0
+   fi
+
+   warning
+   warn "unknown filesystem to mount, doesn't seem to be MGS, MDT, or OST"
+}
+
+do_umount_filesystem() {
+   echo $"   Unmounting LUSTRE '${FSName}': "
+   local strerror=
+
+   # IF MDS, umount MDT, then unmount all OSTs
+   am_i_mds
+   if [ $? -eq 0 ]; then
+      echo -n $"      `hostname -s`: "
+      strerror=$(umount -vat lustre)
+      passed
+      for node in "${!NodeDesc[@]}"; do
+         if [ ${NodeDesc["$node"]} == "oss" ]; then
+            echo
+            echo -n $"      $node: "
+            ssh -nx "$node" 'umount -vat lustre'
+            passed
+         fi
+      done
+   fi
+
+   # if OST, unmount MDT, then unmount only my OSTs
+   am_i_oss
+   if [ $? -eq 0 ]; then
+      strerror=$(ssh -nx "$MDSServer" 'umount /mnt/mdt' 2>&1)
+      strerror=$(umount -vat lustre)
+   fi
+   
+   return 0
+}
+
+start() {
+   echo -n $"Starting $prog: "
+   local NodeName= quorum= PSIP=
+
+   echo $$ > $pidfile
+
+   # Only run if LUSTRE is scheduled to start
+   chkconfig lustre
+   if [ $? -ne 0 ]; then
+      success
+      echo
+      do_exit
+   fi
+
+   # Ensure that a LUSTRE MDSServer is defined
+   if [ -z "$MDSServer" ]; then
+      failure
+      echo
+      die "'\$MDSServer' is not defined in $config!"
+   fi
+
+   echo
+   do_scan_disks
+   echo
+
+   do_exit
+}
+
+stop() {
+   echo -n $"Stopping $prog: "
+   local strerror=
+
+   echo
+   do_umount_filesystem
+
+   [ -f "$pidfile" ] && strerror=$(killproc -p "$pidfile" "$prog")
+   rm -f "$lockfile"
+   success
+   echo
+
+   return 0
+}
+
+restart() {
+   local PSIP=
+
+   stop
+
+   # Ensure that a LUSTRE NodeDesc is defined
+   if [ ${#NodeDesc[@]} -eq 0 ]; then
+      failure
+      echo
+      warn "'%NodeDesc' is not defined in $config!"
+      STATUS=-1
+      return 1
+   fi
+
+   # Ensure that this program only runs on the MDSServer node
+   am_i_mds
+   if [ $? -ne 0 ]; then
+      success
+      echo
+      do_exit
+   fi
+
+   do_rescan_scsi
+   echo
+
+   start
+}
+
+rebind() {
+   echo $"Binding free system disks: "
+
+   do_rescan_scsi
+   do_scan_disks
+
+#some stuff
+}
+
+format_disks() {
+   echo $"   `hostname -s`: Initializing disk sectors: "
+
+   disks=$(awk '/[[:space:]]+sd[^[:digit:]]+$/ \
+      {                                        \
+         if (NF > 3 && $3 > 1)                 \
+            print $4                           \
+      }' /proc/partitions 2>&1)
+
+   if [ $? -ne 0 ]; then
+      warning
+      echo
+      warn $"$disks"
+      warn 'failed to enumerate /proc/partitions!'
+      return 1
+   fi
+
+   if [ -z "$disks" ]; then
+      warning
+      echo
+      warn 'failed to locate any locally-attached disk!'
+      return 1
+   fi
+
+   while read disk; do
+      grep -q "^/dev/$disk" '/proc/self/mounts' && continue
+      echo -n $"      /dev/$disk: "
+      strerror=$(wipefs -a /dev/$disk 2>&1)
+      if [ $? -eq 0 ]; then
+         success
+         echo
+      else
+         warning
+         echo
+         warn $"$strerror"
+         warn "unable to exec 'wipefs -a /dev/$disk', skipping!"
+         continue
+      fi
+   done < <(echo "$disks")
+}
+
+destroy() {
+   am_i_mds
+   if [ $? -ne 0 ]; then
+      warn "Can only call destroy from MDS"
+      do_exit
+   fi
+
+   echo -n $"Destroying LUSTRE data on all system drives: Proceed? [Ny]? "
+   local answer= block_size= disks= strerror=
+
+   read answer
+
+   [ "$answer" != 'y' -a "$answer" != 'Y' ] && return 0
+
+   do_umount_filesystem
+
+   format_disks
+
+   for node in "${!NodeDesc[@]}"; do
+      if [ ${NodeDesc["$node"]} == "oss" ]; then
+         echo
+         ssh -nx "$node" 'service autolustre force-destroy'
+         passed
+      fi
+   done
+
+   echo
+
+   return 0
+}
+
+force_destroy() {
+   mount -t lusre | grep -q lustre
+   if [ $? -eq 0 ]; then
+      warn "lustre not unmounted, cant format disks"
+   else
+      format_disks
+   fi
+}
+
+case "$1" in
+   start)
+      start
+      ;;
+
+   stop)
+      stop
+      ;;
+
+   restart)
+      restart
+      ;;
+
+   status)
+      status -p "$pidfile" -l "$lockfile" $prog
+      STATUS=$?
+      ;;
+
+   assimilate|recover|restore)
+      assimilate "$2"
+      ;;
+
+   bind|rebind|redisk|redrive)
+      rebind
+      ;;
+
+   destroy)
+      destroy
+      ;;
+
+   force-destroy)
+      force_destroy
+      ;;
+
+   *)
+      echo $"Usage: $prog {start|stop|restart|status}"
+      echo $"       $prog {bind|rebind|redisk|redrive}"
+      echo $"       $prog {assimilate|recover|restore} <node>"
+esac
+
+exit $STATUS

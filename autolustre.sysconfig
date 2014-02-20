@@ -1,0 +1,59 @@
+##################
+# Requirements/Assumptions:
+#
+# 1. Root authority is required to perform all LUSTRE administration tasks.
+#    Said authority must be configured a priori to using autolustre.
+#
+# 2. AUTOLUSTRE supports only 1 MDS at this time.  Exactly and only 1 MDS
+#    server MUST be defined.
+#
+# 3. The nodes MUST have local/SAN access to NO other disk(s)
+#    that appear in /proc/partitions as 'sd?' other than those associated
+#    with the LUSTRE filesystem.
+#
+# 4. Any "free" disk thus seen by the the Servers will be
+#    automatically configured as an OST/MDT/MGT for LUSTRE's use.
+#    exception: only MGS and MDT get created on MDS-server, no other block
+#               devices are needed
+#
+# 5. Destroying of filesystem should be done from MDS only to keep
+#    everything coordinated
+#
+# 6. Current implementation only looks for /dev/sd* disks, and will not
+#    use multipath devices.
+#
+
+TimeOut=10              # retry blocked commands this often (sec)
+
+##################
+# Lustre definitions:
+#
+#    FSName             Unique name for LUSTRE filesystem
+#
+#    MDSServer          Exactly 1 MDS server MUST be defined
+#
+#    NodeDesc           Bash associative array specifying a node
+#                       description of the form:
+#
+#                          NodeDesc[NodeName]='NodeDesignation'
+#
+#                       where
+#
+#                          NodeName is a hostname
+#
+#                       and
+#
+#                          NodeDesignation = <mds|oss>
+#
+#                       The MDSServer node MUST be keys in the NodeDesc
+#                       definition.
+#
+
+FSName='Lustre'
+
+MDSServer='mds01'
+
+declare -A NodeDesc             # bash associative array
+NodeDesc["$MDSServer"]='mds'    # MANDATORY!  DO NOT omit/change this!
+NodeDesc['oss01']='oss'
+NodeDesc['oss02']='oss'
