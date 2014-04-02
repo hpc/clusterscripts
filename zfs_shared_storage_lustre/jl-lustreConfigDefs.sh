@@ -35,13 +35,27 @@ dataDevices=8
 # Bash indexed arrays, 0-based, that hold the host names of the nodes that
 # fill various roles.
 #
-declare -a MGS_hosts
-MGS_hosts=(mallorca)
+# If we're assigning MGS and MDS nodes to be allocated specifically to one
+# of the file systems, we want to use bash Associative Arrays (declare -A),
+# otherwise we want to use bash Indexed Arrays (declare -a).
+#
+declare -A MGS_hosts
+MGS_hosts=([ylw]=mallorca [trq]=glacier)
 
-declare -a MDS_hosts
+#declare -a MGS_hosts
+#MGS_hosts=(mallorca glacier)
 
-declare -a MGS_MDS_hosts
-MGS_MDS_hosts=(jl-mds01 jl-mds02)
+declare -A MDS_hosts
+MDS_hosts=([ylw]=mallorca [trq]=glacier)
+
+#declare -a MDS_hosts
+#MDS_hosts=(mallorca glacier)
+
+declare -A MGS_MDS_hosts
+MGS_MDS_hosts=([ylw]=jl-mds01 [trq]=jl-mds02)
+
+#declare -a MGS_MDS_hosts
+#MGS_MDS_hosts=(jl-mds01 jl-mds02)
 
 declare -a OSS_hosts
 OSS_hosts=(jl-oss01 jl-oss02)

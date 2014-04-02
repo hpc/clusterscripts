@@ -35,139 +35,6 @@ fi
 
 ################################################################################
 #
-# We create a ZFS zpool consisting of a single storage device that will become
-# the storage for the MGT.
-#
-################################################################################
-function mgsZpoolCreate () {
-
-#
-# Get all of the storage device names that are available to be put into zpools
-# for a MGT on this node.
-#
-  for i in $( ls /dev/sd* ); do
-#    echo "sd device is \"${i}\"."
-
-    if [ "${i}" == "/dev/sda" ]; then
-#      zpool create -f mgtpool ${i}
-      break
-    fi
-  done
-
-#  echo "${i} - mkfs.lustre ..."
-}
-
-
-################################################################################
-#
-# We create a ZFS zpool consisting of a single storage device that will become
-# the storage for the MDT.
-#
-################################################################################
-function mdsZpoolCreate () {
-
-#
-# Get all of the storage device names that are available to be put into zpools
-# for a MDT on this node.
-#
-  for i in $( ls /dev/sd* ); do
-#    echo "sd device is \"${i}\"."
-
-    if [ "${i}" == "/dev/sda" ]; then
-#      zpool create -f mdtpool ${i}
-      break
-    fi
-  done
-
-#  echo "${i} - mkfs.lustre ..."
-}
-
-
-################################################################################
-#
-# We create a ZFS zpool consisting of a single storage device that will become
-# the storage for the MGT.
-#
-# We also create a ZFS zpool consisting of a single storage device that will
-# become the storage for the MDT.
-#
-# Both the MGT and the MDT are hosted on this node, as is acts as both types
-# of server.
-#
-################################################################################
-function mgs_mdsZpoolCreate () {
-
-#
-# Get all of the storage device names that are available to be put into zpools
-# for a MGT and a MDT on this node.
-#
-  for i in $( ls /dev/sd* ); do
-#    echo "sd device is \"${i}\"."
-
-    if [ "${i}" == "/dev/sda" ]; then
-#      zpool create -f mgtpool ${i}
-       echo "sd device \"${i}\" is the MGT."
-    fi
-
-    if [ "${i}" == "/dev/sdb" ]; then
-#      zpool create -f mdtpool ${i}
-       echo "sd device \"${i}\" is the MDT."
-    fi
-  done
-
-#  echo "${i} - mkfs.lustre ..."
-}
-
-
-################################################################################
-#
-# This function creates the ZFS zpools for an OSS.
-#
-# It may be desirable to use a separate device for the ZFS Intent Log to get
-# better performance when the data that is written needs to be on stable
-# storage devices. By default it is allocated from blocks of the devices used
-# in the pool. One may wish to use a NVM device for this purpose. Add the "log"
-# keyword and the device name to be used for the log.
-#
-# It may be desirable to use a separated device for a cache to get better
-# performance for random read workloads whose data is mainly static. Again,
-# this may be best served by a NVM device. Add the "cache" keyword and the
-# device name to be used for the cache.
-#
-################################################################################
-function ossZpoolsCreate () {
-
-  zpoolsCreated=0
-
-#
-# Get all of the storage device names that are available to be put into zpools
-# on this node.
-#
-  for i in $( ls /dev/sd* ); do
-    echo "sd device is \"${i}\"."
-  done
-
-#
-# Loop until not enough devices left to build a ZFS zpool.
-#
-# Build a string of the devices that consists of ( dataDevices + zLevel ) of
-# them. Then create the ZFS zpool with that string.
-#
-#  zpool create -f <pool-name> <raidz1 or raidz2 or raidz3> <device-name-string>
-
-#
-# After creating a zpool, count it.
-#
-  zpoolsCreated=`expr ${zpoolsCreated} + 1`
-
-  for (( i=1; i <= zpoolsCreated; i++ )); do
-    echo "${i} - mkfs.lustre ..."
-  done
-}
-
-
-################################################################################
-#
 # The main execution control of this file starts below here. Above were
 # variable and function declarations that are used by this file.
 #
@@ -280,7 +147,7 @@ fi
 #echo "This host's class is \"${hostClass}\"."
 
 if [ "$hostClass" == "" ]; then
-  echo "Host \"${shortHostname}\" is not a host in this Lustre file system."
+  echo "Host \"${shortHostname}\" is not a host in this Lustre configuration."
   exit 1
 fi
 
@@ -297,12 +164,15 @@ else
   case $hostClass in
     MGS)
       mgsZpoolCreate
+      mgsMountZFSfromZpool
       ;;
     MDS)
       mdsZpoolCreate
+      mdsMountZFSfromZpool
       ;;
     MGS_MDS)
       mgs_mdsZpoolCreate
+      mdsMountZFSfromZpool
       ;;
     OSS)
       case $zLevel in
@@ -315,16 +185,245 @@ else
           ;;
       esac
 
+#@@@
       ossZpoolsCreate
+#
+# Base zpool names on the host, its type (ost), and which pool of the host
+# this is, from 1 .. n, were n is the max number of pools this node can support.
+# That is based on how many devices are connected to it and how many devices
+# per zpool, which depends on how many data devices and parity devices a zpool
+# has.
+#
+# zpool create -f ${shortHostname}-ost-zpool${i} raidz${zLevel} <device-list-of-dataDevice+zLevel-devices>
+#   ...
+# zpool create -f ${shortHostname}-ost-zpool${i} raidz${zLevel} <device-list-of-dataDevice+zLevel-devices>
+
+      ossMountZFSfromZpool
+# 
+# Loop over FSbaseName and do two mkfs.lustre --ost ... for each FSbaseName.
+#
+# Do the same for each OST. I'll have to think about how to use the variables here to create
+# the correct naming scheme.
+#
+# mkfs.lustre --ost --fsname=lustre1 --mgsnode=lustre-mds1@tcp1 --index=0 ost1-1pool/ost1-1 /ost1-1pool
+# mkfs.lustre --ost --fsname=lustre2 --mgsnode=lustre-mds2@tcp1 --index=0 ost1-1pool/2ost1-1 /ost1-1pool
+# mkfs.lustre --ost --fsname=lustre1 --mgsnode=lustre-mds1@tcp1 --index=1 ost1-2pool/ost1-2 /ost1-2pool
+# mkfs.lustre --ost --fsname=lustre2 --mgsnode=lustre-mds2@tcp1 --index=1 ost1-2pool/2ost1-2 /ost1-2pool
+#
+# Now we need to make the mount points and mount them too. I'm out of time right now.
+#
       ;;
   esac
-
-# @@@
-# Loop over number of zpools then for each of those loop over file systems names (e.g. ylw, trq).
-# @@@
-#  for fs in $( echo $FSbaseNames ); do
-#    echo "File system base name of \"${fs}\" processed."
-#  done
 fi
 
 exit 0
+
+################################################################################
+#
+# We create a ZFS zpool consisting of a single storage device that will become
+# the storage for the MGT.
+#
+################################################################################
+function mgsZpoolCreate () {
+
+  for i in $( ls /dev/sd* ); do
+#    echo "sd device is \"${i}\"."
+
+    if [ "${i}" == "/dev/sda" ]; then
+#
+# Base zpool name on the node's name and the type of node (MGS).
+#
+      zpool create -f ${shortHostname}-mgt-zpool ${i}
+
+      break
+    fi
+  done
+}
+
+################################################################################
+#
+# Format the zpool as a ZFS file system to be the MGS's MGT, and mount it.
+#
+################################################################################
+function mgsMountZFSfromZpool () {
+
+#
+# Base the Lustre "--fsname", ZFS file system name, and mount point on FSbaseName.
+#
+
+  for fs in $( echo $FSbaseNames ); do
+#    echo "File system base name of \"${fs}\" processed."
+    if [ "${MGS_hosts[${fs}]}" == "${shortHostname}" ]; then
+      mkfs.lustre \
+        --mgs \
+        --fsname=lustre-${fs} \
+        ${shortHostname}-mgt-zpool/mgt-${fs} \
+        /${shortHostname}-mgt-zpool
+      mkdir -p /mnt/mgt-${fs}
+      mount -t lustre ${shortHostname}-mgt-zpool/mgt-${fs} /mnt/mgt-${fs}
+
+      break
+    fi
+  done
+}
+
+################################################################################
+#
+# We create a ZFS zpool consisting of a single storage device that will become
+# the storage for the MDT.
+#
+################################################################################
+function mdsZpoolCreate () {
+
+#
+# Get all of the storage device names that are available to be put into zpools
+# for a MDT on this node.
+#
+  for i in $( ls /dev/sd* ); do
+#    echo "sd device is \"${i}\"."
+
+    if [ "${i}" == "/dev/sda" ]; then
+      zpool create -f ${shortHostname}-mdt-zpool ${i}
+
+      break
+    fi
+  done
+}
+
+################################################################################
+#
+# Format the zpool as a ZFS file system to be the MDS's MDT, and mount it.
+#
+################################################################################
+function mdsMountZFSfromZpool () {
+
+#
+# Base the Lustre "--fsname", ZFS file system name, and mount point on FSbaseName.
+#
+
+  for fs in $( echo $FSbaseNames ); do
+#    echo "File system base name of \"${fs}\" processed."
+    if [ "${MDS_hosts[${fs}]}" == "${shortHostname}" ]; then
+      mkfs.lustre \
+        --mdt \
+        --fsname=lustre-${fs} \
+        --mgsnode=$MGS_hosts[${fs}]@tcp1 \
+        --index=0 \
+        ${shortHostname}-mdt-zpool/mdt-${fs} \
+        /${shortHostname}-mdt-zpool
+      mkdir -p /mnt/mdt-${fs}
+      mount -t lustre ${shortHostname}-mdt-zpool/mdt-${fs} /mnt/mdt-${fs}
+
+      break
+    fi
+  done
+}
+
+################################################################################
+#
+# We create a ZFS zpool consisting of a single storage device that will become
+# the storage for the MGT.
+#
+# We also create a ZFS zpool consisting of a single storage device that will
+# become the storage for the MDT.
+#
+# Both the MGT and the MDT are hosted on this node, as is acts as both types
+# of server.
+#
+################################################################################
+function mgs_mdsZpoolCreate () {
+
+  for i in $( ls /dev/sd* ); do
+#    echo "sd device is \"${i}\"."
+
+    if [ "${i}" == "/dev/sda" ]; then
+      zpool create -f ${shortHostname}-mgt-zpool ${i}
+    elif [ "${i}" == "/dev/sdb" ]; then
+      zpool create -f ${shortHostname}-mdt-zpool ${i}
+    fi
+  done
+}
+
+################################################################################
+#
+# Format the zpools as ZFS file systems to be the MGS's MGT, the MDS's MDT,
+# and mount them.
+#
+################################################################################
+function mgs_mdsMountZFSfromZpool () {
+
+#
+# Base the Lustre "--fsname", ZFS file system name, and mount point on FSbaseName.
+#
+
+  for fs in $( echo $FSbaseNames ); do
+#    echo "File system base name of \"${fs}\" processed."
+    if [ "${MGS_MDS_hosts[${fs}]}" == "${shortHostname}" ]; then
+      mkfs.lustre \
+        --mgs \
+        --fsname=lustre-${fs} \
+        ${shortHostname}-mgt-zpool/mgt-${fs} \
+        /${shortHostname}-mgt-zpool
+      mkdir -p /mnt/mgt-${fs}
+      mount -t lustre ${shortHostname}-mgt-zpool/mgt-${fs} /mnt/mgt-${fs}
+
+      mkfs.lustre \
+        --mdt \
+        --fsname=lustre-${fs} \
+        --mgsnode=$MGS_MDS_hosts[${fs}]@tcp1 \
+        --index=0 \
+        ${shortHostname}-mdt-zpool/mdt-${fs} \
+        /${shortHostname}-mdt-zpool
+      mkdir -p /mnt/mdt-${fs}
+      mount -t lustre ${shortHostname}-mdt-zpool/mdt-${fs} /mnt/mdt-${fs}
+
+      break
+    fi
+  done
+}
+
+################################################################################
+#
+# This function creates the ZFS zpools for an OSS.
+#
+# It may be desirable to use a separate device for the ZFS Intent Log to get
+# better performance when the data that is written needs to be on stable
+# storage devices. By default it is allocated from blocks of the devices used
+# in the pool. One may wish to use a NVM device for this purpose. Add the "log"
+# keyword and the device name to be used for the log.
+#
+# It may be desirable to use a separated device for a cache to get better
+# performance for random read workloads whose data is mainly static. Again,
+# this may be best served by a NVM device. Add the "cache" keyword and the
+# device name to be used for the cache.
+#
+################################################################################
+function ossZpoolsCreate () {
+
+  zpoolsCreated=0
+
+#
+# Get all of the storage device names that are available to be put into zpools
+# on this node.
+#
+  for i in $( ls /dev/sd* ); do
+    echo "sd device is \"${i}\"."
+  done
+
+#
+# Loop until not enough devices left to build a ZFS zpool.
+#
+# Build a string of the devices that consists of ( dataDevices + zLevel ) of
+# them. Then create the ZFS zpool with that string.
+#
+#  zpool create -f <pool-name> <raidz1 or raidz2 or raidz3> <device-name-string>
+
+#
+# After creating a zpool, count it.
+#
+  zpoolsCreated=`expr ${zpoolsCreated} + 1`
+
+  for (( i=1; i <= zpoolsCreated; i++ )); do
+    echo "${i} - mkfs.lustre ..."
+  done
+}
