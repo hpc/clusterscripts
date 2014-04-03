@@ -164,14 +164,17 @@ else
   case $hostClass in
     MGS)
       mgsZpoolCreate
+      mgsFormatZFSfromZpool
       mgsMountZFSfromZpool
       ;;
     MDS)
       mdsZpoolCreate
+      mdsFormatZFSfromZpool
       mdsMountZFSfromZpool
       ;;
     MGS_MDS)
       mgs_mdsZpoolCreate
+      mdsFormatZFSfromZpool
       mdsMountZFSfromZpool
       ;;
     OSS)
@@ -198,7 +201,7 @@ else
 #   ...
 # zpool create -f ${shortHostname}-ost-zpool${i} raidz${zLevel} <device-list-of-dataDevice+zLevel-devices>
 
-      ossMountZFSfromZpool
+      ossFormatZFSfromZpool
 # 
 # Loop over FSbaseName and do two mkfs.lustre --ost ... for each FSbaseName.
 #
@@ -209,6 +212,8 @@ else
 # mkfs.lustre --ost --fsname=lustre2 --mgsnode=lustre-mds2@tcp1 --index=0 ost1-1pool/2ost1-1 /ost1-1pool
 # mkfs.lustre --ost --fsname=lustre1 --mgsnode=lustre-mds1@tcp1 --index=1 ost1-2pool/ost1-2 /ost1-2pool
 # mkfs.lustre --ost --fsname=lustre2 --mgsnode=lustre-mds2@tcp1 --index=1 ost1-2pool/2ost1-2 /ost1-2pool
+
+      ossMountZFSfromZpool
 #
 # Now we need to make the mount points and mount them too. I'm out of time right now.
 #
@@ -242,13 +247,13 @@ function mgsZpoolCreate () {
 
 ################################################################################
 #
-# Format the zpool as a ZFS file system to be the MGS's MGT, and mount it.
+# Format the zpool as a ZFS file system to be the MGS's MGT.
 #
 ################################################################################
-function mgsMountZFSfromZpool () {
+function mgsFormatZFSfromZpool () {
 
 #
-# Base the Lustre "--fsname", ZFS file system name, and mount point on FSbaseName.
+# Base the Lustre "--fsname" and ZFS file system name on FSbaseName.
 #
 
   for fs in $( echo $FSbaseNames ); do
@@ -259,6 +264,26 @@ function mgsMountZFSfromZpool () {
         --fsname=lustre-${fs} \
         ${shortHostname}-mgt-zpool/mgt-${fs} \
         /${shortHostname}-mgt-zpool
+
+      break
+    fi
+  done
+}
+
+################################################################################
+#
+# Mount the ZFS file system.
+#
+################################################################################
+function mgsMountZFSfromZpool () {
+
+#
+# Base the mount point on FSbaseName.
+#
+
+  for fs in $( echo $FSbaseNames ); do
+#    echo "File system base name of \"${fs}\" processed."
+    if [ "${MGS_hosts[${fs}]}" == "${shortHostname}" ]; then
       mkdir -p /mnt/mgt-${fs}
       mount -t lustre ${shortHostname}-mgt-zpool/mgt-${fs} /mnt/mgt-${fs}
 
@@ -292,13 +317,13 @@ function mdsZpoolCreate () {
 
 ################################################################################
 #
-# Format the zpool as a ZFS file system to be the MDS's MDT, and mount it.
+# Format the zpool as a ZFS file system to be the MDS's MDT.
 #
 ################################################################################
-function mdsMountZFSfromZpool () {
+function mdsFormatZFSfromZpool () {
 
 #
-# Base the Lustre "--fsname", ZFS file system name, and mount point on FSbaseName.
+# Base the Lustre "--fsname" and ZFS file system name on FSbaseName.
 #
 
   for fs in $( echo $FSbaseNames ); do
@@ -311,6 +336,26 @@ function mdsMountZFSfromZpool () {
         --index=0 \
         ${shortHostname}-mdt-zpool/mdt-${fs} \
         /${shortHostname}-mdt-zpool
+
+      break
+    fi
+  done
+}
+
+################################################################################
+#
+# Mount the ZFS file system.
+#
+################################################################################
+function mdsMountZFSfromZpool () {
+
+#
+# Base the mount point on FSbaseName.
+#
+
+  for fs in $( echo $FSbaseNames ); do
+#    echo "File system base name of \"${fs}\" processed."
+    if [ "${MDS_hosts[${fs}]}" == "${shortHostname}" ]; then
       mkdir -p /mnt/mdt-${fs}
       mount -t lustre ${shortHostname}-mdt-zpool/mdt-${fs} /mnt/mdt-${fs}
 
@@ -346,14 +391,13 @@ function mgs_mdsZpoolCreate () {
 
 ################################################################################
 #
-# Format the zpools as ZFS file systems to be the MGS's MGT, the MDS's MDT,
-# and mount them.
+# Format the zpools as ZFS file systems to be the MGS's MGT and the MDS's MDT.
 #
 ################################################################################
-function mgs_mdsMountZFSfromZpool () {
+function mgs_mdsFormatZFSfromZpool () {
 
 #
-# Base the Lustre "--fsname", ZFS file system name, and mount point on FSbaseName.
+# Base the Lustre "--fsname" and ZFS file system name on FSbaseName.
 #
 
   for fs in $( echo $FSbaseNames ); do
@@ -364,8 +408,6 @@ function mgs_mdsMountZFSfromZpool () {
         --fsname=lustre-${fs} \
         ${shortHostname}-mgt-zpool/mgt-${fs} \
         /${shortHostname}-mgt-zpool
-      mkdir -p /mnt/mgt-${fs}
-      mount -t lustre ${shortHostname}-mgt-zpool/mgt-${fs} /mnt/mgt-${fs}
 
       mkfs.lustre \
         --mdt \
@@ -374,6 +416,30 @@ function mgs_mdsMountZFSfromZpool () {
         --index=0 \
         ${shortHostname}-mdt-zpool/mdt-${fs} \
         /${shortHostname}-mdt-zpool
+
+      break
+    fi
+  done
+}
+
+
+################################################################################
+#
+# Mount the ZFS file systems.
+#
+################################################################################
+function mgs_mdsMountZFSfromZpool () {
+
+#
+# Base the mount points on FSbaseName.
+#
+
+  for fs in $( echo $FSbaseNames ); do
+#    echo "File system base name of \"${fs}\" processed."
+    if [ "${MGS_MDS_hosts[${fs}]}" == "${shortHostname}" ]; then
+      mkdir -p /mnt/mgt-${fs}
+      mount -t lustre ${shortHostname}-mgt-zpool/mgt-${fs} /mnt/mgt-${fs}
+
       mkdir -p /mnt/mdt-${fs}
       mount -t lustre ${shortHostname}-mdt-zpool/mdt-${fs} /mnt/mdt-${fs}
 
